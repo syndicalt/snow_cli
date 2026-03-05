@@ -1,0 +1,41 @@
+{
+  "name": "snow-cli",
+  "version": "0.1.0",
+  "description": "CLI tool for ServiceNow Now Assist Build Agent and instance management",
+  "type": "module",
+  "bin": {
+    "snow": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "start": "node dist/index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "dist"
+  ],
+  "dependencies": {
+    "axios": "^1.7.9",
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
+    "eventsource": "^2.0.2",
+    "ora": "^8.1.1",
+    "@inquirer/prompts": "^7.2.0",
+    "open": "^10.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.7",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.3"
+  },
+  "keywords": [
+    "servicenow",
+    "now-assist",
+    "cli",
+    "snowcli"
+  ],
+  "license": "MIT"
+}

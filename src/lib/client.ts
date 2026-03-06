@@ -31,14 +31,41 @@ export class ServiceNowClient {
 
     this.http.interceptors.response.use(
       (res) => res,
-      (err) => {
+      async (err) => {
         if (axios.isAxiosError(err)) {
           const status = err.response?.status;
+
+          // Retry on rate-limit and transient server errors
+          const retryable = status === 429 || status === 503 || status === 502;
+          const config = err.config as (typeof err.config & { _retryCount?: number });
+
+          if (retryable && config) {
+            config._retryCount = (config._retryCount ?? 0) + 1;
+            if (config._retryCount <= 3) {
+              const retryAfterHeader = err.response?.headers['retry-after'];
+              const baseDelay = 1000 * Math.pow(2, config._retryCount - 1); // 1s, 2s, 4s
+              const delayMs = retryAfterHeader
+                ? Math.max(parseInt(String(retryAfterHeader), 10) * 1000, baseDelay)
+                : baseDelay;
+              await new Promise((resolve) => setTimeout(resolve, delayMs));
+              return this.http.request(config);
+            }
+            // All retries exhausted — include PDI quota hint
+            const detail =
+              (err.response?.data as { error?: { message?: string } })?.error?.message ?? err.message;
+            return Promise.reject(
+              new Error(
+                `ServiceNow API error (${status}): ${detail}\n` +
+                `Hint: PDI instances have lower transaction quotas. ` +
+                `Wait a moment then retry, or reduce the number of artifacts per build.`
+              )
+            );
+          }
+
           const detail =
             (err.response?.data as { error?: { message?: string } })?.error
               ?.message ?? err.message;
-          const error = new Error(`ServiceNow API error (${status}): ${detail}`);
-          return Promise.reject(error);
+          return Promise.reject(new Error(`ServiceNow API error (${status}): ${detail}`));
         }
         return Promise.reject(err);
       }

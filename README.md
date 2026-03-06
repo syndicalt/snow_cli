@@ -2,8 +2,6 @@
 
 A portable CLI for ServiceNow. Query tables, inspect schemas, edit script fields, and generate complete applications using AI — all from your terminal.
 
-## Table of Contents
-
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Commands](#commands)

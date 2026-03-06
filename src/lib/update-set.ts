@@ -410,6 +410,43 @@ export function generateUpdateSetXML(build: SNBuildResponse): string {
 
 // ─── Public: Table API push ──────────────────────────────────────────────────
 
+/** Returns a query fragment that restricts results to the target scope. */
+function scopeFilter(scopeSysId: string | undefined): string {
+  return `^sys_scope=${scopeSysId ?? 'global'}`;
+}
+
+/**
+ * Warn if any artifact name already exists in a *different* scope on the instance.
+ * Emits a warning per conflict via onWarning but does not abort the push.
+ */
+async function checkCrossScope(
+  client: ServiceNowClient,
+  artifacts: SNArtifact[],
+  targetScopeSysId: string | undefined,
+  onWarning: (msg: string) => void
+): Promise<void> {
+  const targetScope = targetScopeSysId ?? 'global';
+  for (const artifact of artifacts) {
+    const table = ARTIFACT_TABLE[artifact.type];
+    if (!table) continue;
+    const name = String(artifact.fields['name'] ?? '');
+    if (!name) continue;
+    try {
+      const conflicts = await client.queryTable(table, {
+        sysparmQuery: `name=${name}^sys_scope!=${targetScope}`,
+        sysparmLimit: 1,
+        sysparmFields: 'sys_id,sys_scope',
+      });
+      if (conflicts.length > 0) {
+        const conflictScope = String((conflicts[0] as Record<string, unknown>)['sys_scope'] ?? 'unknown');
+        onWarning(`  Warning: "${name}" (${artifact.type}) exists in scope "${conflictScope}" — your push targets "${targetScope}" so that record will not be touched`);
+      }
+    } catch {
+      // Ignore check failures — don't block the push
+    }
+  }
+}
+
 export interface PushResult {
   type: string;
   name: string;
@@ -544,6 +581,9 @@ export async function pushArtifacts(
     }
   }
 
+  // Warn about cross-scope name collisions before touching anything
+  await checkCrossScope(client, build.artifacts, scopeSysId, (msg: string) => onProgress?.(msg));
+
   for (const artifact of build.artifacts) {
     const artifactName = String(artifact.fields['name'] ?? artifact.type);
     onProgress?.(`  Pushing ${artifact.type}: ${artifactName}`);
@@ -567,7 +607,7 @@ export async function pushArtifacts(
         if (scopeSysId) { payload['sys_scope'] = scopeSysId; payload['sys_package'] = scopeSysId; }
 
         const existing = await client.queryTable(table, {
-          sysparmQuery: `name=${artifactName}`,
+          sysparmQuery: `name=${artifactName}${scopeFilter(scopeSysId)}`,
           sysparmLimit: 1,
           sysparmFields: 'sys_id',
         });
@@ -614,7 +654,7 @@ async function pushTableArtifact(
   if (scopeSysId) { dbObjPayload['sys_scope'] = scopeSysId; dbObjPayload['sys_package'] = scopeSysId; }
 
   const existingTable = await client.queryTable('sys_db_object', {
-    sysparmQuery: `name=${tableName}`,
+    sysparmQuery: `name=${tableName}${scopeFilter(scopeSysId)}`,
     sysparmLimit: 1,
     sysparmFields: 'sys_id',
   });
@@ -655,7 +695,7 @@ async function pushTableArtifact(
     if (scopeSysId) { dictPayload['sys_scope'] = scopeSysId; dictPayload['sys_package'] = scopeSysId; }
 
     const existingDict = await client.queryTable('sys_dictionary', {
-      sysparmQuery: `name=${tableName}^element=${element}`,
+      sysparmQuery: `name=${tableName}^element=${element}${scopeFilter(scopeSysId)}`,
       sysparmLimit: 1,
       sysparmFields: 'sys_id',
     });
@@ -681,7 +721,7 @@ async function pushTableArtifact(
         if (scopeSysId) { choicePayload['sys_scope'] = scopeSysId; choicePayload['sys_package'] = scopeSysId; }
 
         const existingChoice = await client.queryTable('sys_choice', {
-          sysparmQuery: `name=${tableName}^element=${element}^value=${choiceVal}`,
+          sysparmQuery: `name=${tableName}^element=${element}^value=${choiceVal}${scopeFilter(scopeSysId)}`,
           sysparmLimit: 1,
           sysparmFields: 'sys_id',
         });
@@ -714,7 +754,7 @@ async function pushDecisionTableArtifact(
   if (scopeSysId) { dtPayload['sys_scope'] = scopeSysId; dtPayload['sys_package'] = scopeSysId; }
 
   const existing = await client.queryTable('sys_decision', {
-    sysparmQuery: `name=${dtName}`,
+    sysparmQuery: `name=${dtName}${scopeFilter(scopeSysId)}`,
     sysparmLimit: 1,
     sysparmFields: 'sys_id',
   });
@@ -813,7 +853,7 @@ async function pushFlowActionArtifact(
   if (scopeSysId) { actionPayload['sys_scope'] = scopeSysId; actionPayload['sys_package'] = scopeSysId; }
 
   const existing = await client.queryTable('sys_hub_action_type_definition', {
-    sysparmQuery: `name=${actionName}`,
+    sysparmQuery: `name=${actionName}${scopeFilter(scopeSysId)}`,
     sysparmLimit: 1,
     sysparmFields: 'sys_id',
   });

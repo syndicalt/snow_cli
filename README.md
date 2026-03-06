@@ -8,6 +8,7 @@ A portable CLI for ServiceNow. Query tables, inspect schemas, edit script fields
   - [snow instance](#snow-instance)
   - [snow table](#snow-table)
   - [snow schema](#snow-schema)
+    - [snow schema map](#snow-schema-map)
   - [snow script](#snow-script)
   - [snow provider](#snow-provider)
   - [snow ai](#snow-ai)
@@ -134,7 +135,9 @@ snow table delete incident <sys_id> --yes   # skip confirmation
 
 ### `snow schema`
 
-Inspect field definitions for any table by querying `sys_dictionary`.
+Inspect field definitions for any table, or generate a full cross-table schema map.
+
+#### Field inspection
 
 ```bash
 snow schema incident
@@ -143,6 +146,85 @@ snow schema cmdb_ci_server --format json    # JSON output
 ```
 
 Output columns: field name, label, type, max length, and flags (`M` = mandatory, `R` = read-only, `ref=<table>` for reference fields).
+
+#### `snow schema map`
+
+Crawl a table's reference fields (and optionally M2M links) to generate a complete relational schema diagram. The crawl follows references up to the specified depth, building a graph of all connected tables. The output is written to disk in Mermaid (`.mmd`) or DBML (`.dbml`) format.
+
+```bash
+# Mermaid diagram, depth 2 (default)
+snow schema map incident
+
+# Follow 3 levels of references
+snow schema map incident --depth 3
+
+# Include glide_list fields as M2M relationships
+snow schema map incident --show-m2m
+
+# DBML format, saved to a specific directory
+snow schema map incident --format dbml --out ./diagrams
+
+# Map a custom application table
+snow schema map x_myco_myapp_request --depth 2 --format dbml
+```
+
+**Options:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `-d, --depth <n>` | `2` | How many levels of reference fields to follow |
+| `--show-m2m` | off | Include `glide_list` fields as many-to-many relationships |
+| `--format <fmt>` | `mermaid` | Output format: `mermaid` or `dbml` |
+| `--out <dir>` | `.` | Directory to write the output file |
+
+**Output files:**
+
+| Format | File | Open with |
+|---|---|---|
+| Mermaid | `<table>-schema.mmd` | VS Code Mermaid Preview, GitHub, mermaid.live |
+| DBML | `<table>-schema.dbml` | dbdiagram.io, any DBML-compatible tool |
+
+**How the crawl works:**
+
+1. Fetches all fields for the root table from `sys_dictionary`
+2. For every `reference`-type field, records the relationship and queues the target table
+3. Repeats for each discovered table until `--depth` is reached
+4. With `--show-m2m`: also follows `glide_list` fields, shown as many-to-many edges
+5. Tables referenced by fields that fall outside the crawl depth are rendered as **stub placeholders** (marked `not crawled`) so all references in the diagram resolve without broken links
+
+**Example output (Mermaid):**
+```
+incident }o--|| sys_user : "Caller"
+incident }o--|| problem : "Problem"
+incident }o--|| change_request : "RFC"
+sys_user }o--|| cmn_department : "Department"
+sys_user }o--|| core_company : "Company"
+...
+cmn_location { string sys_id }   ← stub: referenced but not crawled at this depth
+```
+
+**Example output (DBML):**
+```dbml
+Table incident [note: 'Incident'] {
+  caller_id varchar(32) [ref: > sys_user.sys_id]
+  problem_id varchar(32) [ref: > problem.sys_id]
+  ...
+}
+
+Table sys_user [note: 'User'] { ... }
+
+// Placeholder tables — referenced but not crawled (increase --depth to explore)
+Table cmn_schedule [note: 'not crawled'] {
+  sys_id varchar(32) [pk]
+}
+```
+
+**Cardinality notation:**
+
+| Relationship | Mermaid | Meaning |
+|---|---|---|
+| Reference field | `}o--\|\|` | Many records → one target |
+| Glide list (M2M) | `}o--o{` | Many records ↔ many targets |
 
 ---
 

@@ -1,10 +1,10 @@
 {
-  "name": "snow-cli",
-  "version": "0.1.0",
+  "name": "@syndicalt/snow-cli",
+  "version": "1.0.0",
   "description": "CLI tool for ServiceNow Now Assist Build Agent and instance management",
   "type": "module",
   "bin": {
-    "snow": "./dist/index.js"
+    "snow": "dist/index.js"
   },
   "scripts": {
     "build": "tsup",
@@ -37,5 +37,16 @@
     "cli",
     "snowcli"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "homepage": "https://github.com/syndicalt/snow_cli#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/syndicalt/snow_cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/syndicalt/snow_cli/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
 }

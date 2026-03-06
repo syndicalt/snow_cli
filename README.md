@@ -149,23 +149,32 @@ Output columns: field name, label, type, max length, and flags (`M` = mandatory,
 
 #### `snow schema map`
 
-Crawl a table's reference fields (and optionally M2M links) to generate a complete relational schema diagram. The crawl follows references up to the specified depth, building a graph of all connected tables. The output is written to disk in Mermaid (`.mmd`) or DBML (`.dbml`) format.
+Crawl a table's reference and M2M fields to generate a complete relational schema diagram. The crawl follows references to the specified depth, building a graph of all connected tables including their scope information. Outputs Mermaid (`.mmd`) or DBML (`.dbml`) to disk.
 
 ```bash
 # Mermaid diagram, depth 2 (default)
 snow schema map incident
 
+# DBML format, custom filename, saved to a directory
+snow schema map incident --format dbml --out ./diagrams --name incident-full
+
 # Follow 3 levels of references
 snow schema map incident --depth 3
 
-# Include glide_list fields as M2M relationships
+# Include glide_list (M2M) relationships
 snow schema map incident --show-m2m
 
-# DBML format, saved to a specific directory
-snow schema map incident --format dbml --out ./diagrams
+# Also crawl tables that reference incident (inbound — keep depth low)
+snow schema map incident --inbound --depth 1
 
-# Map a custom application table
-snow schema map x_myco_myapp_request --depth 2 --format dbml
+# Include choice field enum blocks in DBML output
+snow schema map incident --format dbml --enums
+
+# Generate the diagram then have the AI explain the data model
+snow schema map incident --explain
+
+# All options combined
+snow schema map x_myco_myapp_request --depth 2 --format dbml --enums --explain --name myapp-schema
 ```
 
 **Options:**
@@ -175,47 +184,102 @@ snow schema map x_myco_myapp_request --depth 2 --format dbml
 | `-d, --depth <n>` | `2` | How many levels of reference fields to follow |
 | `--show-m2m` | off | Include `glide_list` fields as many-to-many relationships |
 | `--format <fmt>` | `mermaid` | Output format: `mermaid` or `dbml` |
-| `--out <dir>` | `.` | Directory to write the output file |
+| `--out <dir>` | `.` | Directory to write the output file(s) |
+| `--name <name>` | `<table>-schema` | Base filename — extension added automatically |
+| `--inbound` | off | Also crawl tables that have reference fields pointing *to* this table |
+| `--enums` | off | Fetch `sys_choice` values and emit Enum blocks (DBML) or `%%` comments (Mermaid) |
+| `--explain` | off | Use the active AI provider to generate a plain-English explanation of the schema |
 
 **Output files:**
 
 | Format | File | Open with |
 |---|---|---|
-| Mermaid | `<table>-schema.mmd` | VS Code Mermaid Preview, GitHub, mermaid.live |
-| DBML | `<table>-schema.dbml` | dbdiagram.io, any DBML-compatible tool |
+| Mermaid | `<name>.mmd` | VS Code Mermaid Preview, GitHub, mermaid.live |
+| DBML | `<name>.dbml` | dbdiagram.io, any DBML-compatible tool |
+| Explanation | `<name>.explanation.md` | Any Markdown viewer (`--explain` only) |
 
 **How the crawl works:**
 
-1. Fetches all fields for the root table from `sys_dictionary`
+1. Fetches all fields for the root table from `sys_dictionary`, plus label and `sys_scope` via `sys_db_object`
 2. For every `reference`-type field, records the relationship and queues the target table
 3. Repeats for each discovered table until `--depth` is reached
 4. With `--show-m2m`: also follows `glide_list` fields, shown as many-to-many edges
-5. Tables referenced by fields that fall outside the crawl depth are rendered as **stub placeholders** (marked `not crawled`) so all references in the diagram resolve without broken links
+5. With `--inbound`: additionally queues tables that have reference fields pointing *to* the current table
+6. Tables referenced by fields that fall outside the crawl depth are rendered as **stub placeholders** (marked `not crawled`) so all references in the diagram resolve without broken links
+
+> **Tip:** `--inbound` with depth > 1 can produce very large graphs for highly-referenced tables like `sys_user` or `task`. Use `--depth 1` when combining these flags. A warning is also printed when the crawl discovers more than 50 tables.
+
+**Scope annotations:**
+
+Each table's application scope is fetched alongside its label. Both output formats include a scope summary header. In DBML, non-Global tables are annotated directly:
+
+```dbml
+// Scopes: Global (12), ITSM (3)
+// Warning: tables from 2 scopes — cross-scope references present
+
+Table incident [note: 'Incident | scope: ITSM'] { ... }
+```
+
+In Mermaid, scope information appears as `%%` comments at the top of the file.
+
+**Choice enums (`--enums`):**
+
+Queries `sys_choice` for every `choice`-type field across all crawled tables. In DBML, each set of choices becomes a named `Enum` block and the field type references it:
+
+```dbml
+Table incident {
+  state incident__state [not null]
+}
+
+Enum incident__state {
+  "1" [note: 'New']
+  "2" [note: 'In Progress']
+  "6" [note: 'Resolved']
+}
+```
+
+In Mermaid, choice values are emitted as `%%` comments since `erDiagram` has no enum syntax.
+
+**AI explanation (`--explain`):**
+
+Requires a configured AI provider (`snow provider set`). After writing the schema file, the CLI sends the schema content to the active LLM and saves the Markdown response to `<name>.explanation.md`. The explanation is also printed to the terminal. It covers the business domain, key tables, notable relationships, and any cross-scope dependencies.
+
+```bash
+snow provider set anthropic   # configure a provider first
+snow schema map incident --format dbml --explain
+```
 
 **Example output (Mermaid):**
 ```
+%% Scopes: Global (8), ITSM (2)
 incident }o--|| sys_user : "Caller"
 incident }o--|| problem : "Problem"
 incident }o--|| change_request : "RFC"
 sys_user }o--|| cmn_department : "Department"
-sys_user }o--|| core_company : "Company"
 ...
-cmn_location { string sys_id }   ← stub: referenced but not crawled at this depth
+cmn_location { string sys_id }   %% stub: referenced but not crawled
 ```
 
 **Example output (DBML):**
 ```dbml
-Table incident [note: 'Incident'] {
+// Scopes: Global (8), ITSM (2)
+
+Table incident [note: 'Incident | scope: ITSM'] {
   caller_id varchar(32) [ref: > sys_user.sys_id]
   problem_id varchar(32) [ref: > problem.sys_id]
-  ...
+  state incident__state [not null]
 }
-
-Table sys_user [note: 'User'] { ... }
 
 // Placeholder tables — referenced but not crawled (increase --depth to explore)
 Table cmn_schedule [note: 'not crawled'] {
   sys_id varchar(32) [pk]
+}
+
+// Choice field enums
+Enum incident__state {
+  "1" [note: 'New']
+  "2" [note: 'In Progress']
+  "6" [note: 'Resolved']
 }
 ```
 

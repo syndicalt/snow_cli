@@ -11,6 +11,7 @@ import { userCommand } from './commands/user.js';
 import { attachmentCommand } from './commands/attachment.js';
 import { updatesetCommand } from './commands/updateset.js';
 import { statusCommand } from './commands/status.js';
+import { diffCommand } from './commands/diff.js';
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { join, dirname } from 'path';
@@ -77,6 +78,7 @@ program.addCommand(userCommand());
 program.addCommand(attachmentCommand());
 program.addCommand(updatesetCommand());
 program.addCommand(statusCommand());
+program.addCommand(diffCommand());
 program.addCommand(providerCommand());
 program.addCommand(aiCommand());
 

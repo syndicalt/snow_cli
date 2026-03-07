@@ -1,7 +1,7 @@
 {
   "name": "@syndicalt/snow-cli",
-  "version": "1.1.0",
-  "description": "CLI tool for ServiceNow Now Assist Build Agent and instance management",
+  "version": "1.5.0",
+  "description": "CLI tool for ServiceNow automated build and instance management",
   "type": "module",
   "bin": {
     "snow": "dist/index.js"

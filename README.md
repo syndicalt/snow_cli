@@ -15,6 +15,7 @@ A portable CLI for ServiceNow. Query tables, inspect schemas, edit and search sc
   - [snow attachment](#snow-attachment)
   - [snow updateset](#snow-updateset)
   - [snow status](#snow-status)
+  - [snow diff](#snow-diff)
   - [snow provider](#snow-provider)
   - [snow ai](#snow-ai)
 - [Configuration File](#configuration-file)
@@ -76,7 +77,11 @@ snow attachment pull incident <sys_id> --all --out ./downloads
 snow provider set openai
 snow ai build "Create a script include that auto-routes incidents by category and urgency"
 
-# 10. Start an interactive session to build iteratively
+# 10. Compare schema/scripts between instances to detect drift
+snow diff incident --against prod --fields
+snow diff all --against test --scripts --scope x_myco_myapp
+
+# 11. Start an interactive session to build iteratively
 snow ai chat
 ```
 
@@ -699,6 +704,91 @@ snow status --no-errors
 
 ---
 
+### `snow diff`
+
+Compare schema field definitions and script content between two configured instances. Useful for detecting drift — fields added/removed/changed, or scripts that diverged between dev and test/prod.
+
+```bash
+# Compare field definitions for a table
+snow diff incident --against prod --fields
+
+# Compare script content in an app scope between dev and test
+snow diff all --against test --scripts --scope x_myco_myapp
+
+# Compare both fields and scripts
+snow diff sys_script_include --against prod --fields --scripts
+
+# Output as Markdown (for pasting into docs or tickets)
+snow diff incident --against prod --fields --markdown
+```
+
+The source is always the **active instance** (`snow instance use <alias>` to set it). `--against` specifies the target instance alias.
+
+**Arguments:**
+
+| Argument | Description |
+|---|---|
+| `<table>` | Table to compare for `--fields`. Use `all` with `--scripts` to scan all script-bearing tables. |
+
+**Options:**
+
+| Flag | Description |
+|---|---|
+| `--against <alias>` | Target instance alias to compare against (required) |
+| `--fields` | Compare `sys_dictionary` field definitions |
+| `--scripts` | Compare script field content across script-bearing tables |
+| `--scope <prefix>` | Filter scripts by application scope prefix (e.g. `x_myco_myapp`) |
+| `--markdown` | Output as Markdown for docs/tickets |
+
+At least one of `--fields` or `--scripts` is required.
+
+#### Field diff output
+
+Shows every field that was **added** (only in target), **removed** (only in source), or **changed** (type, max_length, mandatory, read_only, reference, or active flag differs):
+
+```
+  Schema diff: incident
+  ──────────────────────────────────────────────────
+  Field                  Status    Detail
+  ──────────────────────────────────────────────────────────────────────────
+  x_myco_priority_code   added     type=string
+  x_myco_legacy_flag     removed   type=boolean
+  category               changed   max_length: 40 → 100
+```
+
+#### Script diff output
+
+For each script-bearing table, shows scripts **added** (only in target), **removed** (only in source), or **changed** (content differs), with a contextual line diff for changed scripts:
+
+```
+  Script diff: sys_script_include
+  ──────────────────────────────────────────────────
+  + NewUtils  (only in prod)
+  - OldHelper (only in dev)
+  ~ IncidentRouter
+
+  IncidentRouter
+  --- dev
+  +++ prod
+  @@ lines 12–16 @@
+     var gr = new GlideRecord('incident');
+  -  gr.addQuery('state', 1);
+  +  gr.addQuery('state', 2);
+     gr.query();
+```
+
+**Script tables scanned** (when using `--scripts`):
+
+| Table | Description |
+|---|---|
+| `sys_script_include` | Script Includes |
+| `sys_script` | Business Rules |
+| `sys_script_client` | Client Scripts |
+| `sys_ui_action` | UI Actions |
+| `sysauto_script` | Scheduled Script Executions |
+
+---
+
 ### `snow provider`
 
 Configure LLM providers used by `snow ai`. API keys and model preferences are stored in `~/.snow/config.json`.
@@ -1049,6 +1139,7 @@ src/
     attachment.ts           snow attachment (list/pull/push)
     updateset.ts            snow updateset (list/current/set/show/capture/export/apply/diff)
     status.ts               snow status
+    diff.ts                 snow diff (cross-instance schema/script comparison)
     provider.ts             snow provider
     ai.ts                   snow ai (build, chat, review, push)
   lib/

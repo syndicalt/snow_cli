@@ -1,0 +1,29 @@
+title: snow-cli
+description: A portable CLI for ServiceNow — query tables, manage scripts, diff instances, and generate applications with AI.
+
+remote_theme: just-the-docs/just-the-docs
+
+url: ""
+
+aux_links:
+  "GitHub":
+    - "https://github.com/tuckerman/snow-cli"
+
+aux_links_new_tab: true
+
+nav_sort: case_insensitive
+
+color_scheme: light
+
+footer_content: "snow-cli &mdash; MIT License"
+
+callouts_level: quiet
+callouts:
+  note:
+    color: blue
+  tip:
+    color: green
+  warning:
+    color: yellow
+  important:
+    color: red

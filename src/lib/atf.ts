@@ -217,38 +217,139 @@ export async function pushATFSuite(
 }
 
 /**
- * Run a test suite via the ATF API and return the result.
+ * Run a test suite via the ServiceNow CICD API (sn_cicd plugin).
+ *
+ * Flow:
+ *   1. POST /api/sn_cicd/testsuite/run?test_suite_sys_id=<id>  → get progress + results links
+ *   2. Poll GET /api/sn_cicd/progress/<id>  until terminal status (0=success, 3=failed, 4=cancelled)
+ *   3. GET /api/sn_cicd/testsuite/results/<id>  → parse test results
+ *
+ * Requires the user to have the sn_cicd role on the instance.
  */
 export async function runATFSuite(
   client: ServiceNowClient,
   suiteSysId: string
 ): Promise<ATFRunResult> {
-  const res = await client.post<{
-    result: {
-      status: string;
-      test_suite_result: {
-        tests_passed?: string;
-        tests_failed?: string;
-        total_tests?: string;
-        test_results?: Array<{
-          test_name?: string;
-          status?: string;
-          message?: string;
-        }>;
-      };
+  // 1. Kick off the run
+  const startRes = await client.post<{
+    links?: {
+      progress?: { id?: string };
+      results?: { id?: string };
     };
-  }>('/api/now/atf/test_suite/run', { id: suiteSysId });
+    status?: string;
+    status_label?: string;
+  }>('/api/sn_cicd/testsuite/run', undefined, {
+    params: { test_suite_sys_id: suiteSysId },
+  });
 
-  const r = res?.result?.test_suite_result ?? {};
+  // Handle both direct and result-wrapped response shapes across SN versions.
+  // Some versions only return a progress link; the results use the same ID.
+  const resData = (startRes as Record<string, unknown>);
+  const inner   = (resData['result'] ?? resData) as Record<string, unknown>;
+  const links   = inner['links'] as Record<string, unknown> | undefined;
+
+  const progressId =
+    ((links?.['progress'] as Record<string, unknown>)?.['id'] as string | undefined) ??
+    ((links?.['results']  as Record<string, unknown>)?.['id'] as string | undefined);
+
+  if (!progressId) {
+    throw new Error(
+      'CICD API did not return a progress link.\n' +
+      'Raw response: ' + JSON.stringify(startRes, null, 2) + '\n' +
+      'Ensure the sn_cicd plugin is active and your user has the sn_cicd role.'
+    );
+  }
+
+  // Results use the same ID as progress (some SN versions omit a separate results link)
+  const resultsId = ((links?.['results'] as Record<string, unknown>)?.['id'] as string | undefined) ?? progressId;
+
+  // 2. Poll progress until terminal
+  // Status codes: 0=pending, 1=running, 2=complete/success, 3=failed, 4=cancelled
+  const TERMINAL = new Set(['2', '3', '4']);
+  const POLL_MS = 5000;
+  const MAX_POLLS = 120; // ~10 min max (PDIs can be slow)
+
+  let done = false;
+  let lastProgressRes: Record<string, unknown> = {};
+  for (let i = 0; i < MAX_POLLS; i++) {
+    await new Promise(resolve => setTimeout(resolve, POLL_MS));
+    const progress = await client.get<Record<string, unknown>>(
+      `/api/sn_cicd/progress/${progressId}`
+    );
+    // Unwrap result wrapper if present
+    lastProgressRes = ((progress['result'] ?? progress) as Record<string, unknown>);
+    if (TERMINAL.has(String(lastProgressRes['status'] ?? ''))) {
+      done = true;
+      break;
+    }
+  }
+
+  if (!done) {
+    throw new Error('ATF test suite timed out after 10 minutes');
+  }
+
+  // 3. Fetch aggregate counts from the CICD results endpoint.
+  //    The completed progress response includes a results link with the correct ID.
+  const progressLinks = lastProgressRes['links'] as Record<string, unknown> | undefined;
+  const finalResultsId =
+    ((progressLinks?.['results'] as Record<string, unknown>)?.['id'] as string | undefined) ??
+    resultsId;
+
+  const resultsRes = await client.get<Record<string, unknown>>(
+    `/api/sn_cicd/testsuite/results/${finalResultsId}`
+  );
+
+  const resultData = ((resultsRes['result'] ?? resultsRes) as Record<string, unknown>);
+  const successCount = parseInt(String(resultData['rolledup_test_success_count'] ?? 0), 10);
+  const failureCount = parseInt(String(resultData['rolledup_test_failure_count'] ?? 0), 10)
+                     + parseInt(String(resultData['rolledup_test_error_count']   ?? 0), 10);
+  const skipCount    = parseInt(String(resultData['rolledup_test_skip_count']    ?? 0), 10);
+  const total        = successCount + failureCount + skipCount;
+
+  // The results link inside resultData points to the sys_atf_test_suite_result record.
+  // Use its sys_id to query per-test details via the Table API.
+  const suiteResultLinks = resultData['links'] as Record<string, unknown> | undefined;
+  const suiteResultSysId =
+    ((suiteResultLinks?.['results'] as Record<string, unknown>)?.['id'] as string | undefined) ??
+    finalResultsId;
+
+  let testResults: Array<{ name: string; status: string; message?: string }> = [];
+  try {
+    const rows = await client.queryTable('sys_atf_result', {
+      sysparmQuery: `test_suite_result=${suiteResultSysId}`,
+      sysparmFields: 'test,status,output',
+      sysparmLimit: 200,
+      sysparmDisplayValue: true,
+    });
+    testResults = rows.map(r => {
+      const testField = r['test'];
+      const name = testField && typeof testField === 'object'
+        ? String((testField as Record<string, unknown>)['display_value'] ?? '(unknown)')
+        : String(testField ?? '(unknown)');
+      const statusStr = String(r['status'] ?? '');
+      return {
+        name,
+        status: statusStr === 'success' || statusStr === 'pass' ? 'success' : 'failure',
+        message: r['output'] ? String(r['output']) : undefined,
+      };
+    });
+  } catch {
+    // Table query unavailable — build synthetic results from aggregate counts so the
+    // caller still gets correct pass/fail totals even without per-test detail.
+    testResults = Array.from({ length: successCount }, (_, i) => ({
+      name: `Test ${i + 1}`,
+      status: 'success' as const,
+    }));
+    for (let i = 0; i < failureCount; i++) {
+      testResults.push({ name: `Test ${successCount + i + 1}`, status: 'failure' });
+    }
+  }
+
   return {
-    status: res?.result?.status ?? 'unknown',
-    passed: parseInt(r.tests_passed ?? '0', 10),
-    failed: parseInt(r.tests_failed ?? '0', 10),
-    total: parseInt(r.total_tests ?? '0', 10),
-    testResults: (r.test_results ?? []).map(t => ({
-      name: t.test_name ?? '(unknown)',
-      status: t.status ?? 'unknown',
-      message: t.message,
-    })),
+    status: String(resultData['test_suite_status'] ?? resultData['status'] ?? 'unknown'),
+    passed: successCount,
+    failed: failureCount,
+    total,
+    testResults,
   };
 }

@@ -15,6 +15,7 @@ import {
   getServerScriptStepConfig,
   pushATFSuite,
   runATFSuite,
+  type ATFRunResult,
 } from '../lib/atf.js';
 import type { SNBuildResponse, SNArtifact, SNScope } from '../types/index.js';
 
@@ -283,6 +284,181 @@ async function buildComponent(
 }
 
 // ---------------------------------------------------------------------------
+// Auto-optimization loop
+// ---------------------------------------------------------------------------
+
+async function runOptimizationLoop(opts: {
+  provider: ReturnType<typeof resolveProvider>;
+  client: ServiceNowClient;
+  build: SNBuildResponse;
+  atfSuiteSysId: string;
+  initialRunResult: ATFRunResult;
+  maxRetries: number;
+  runDir: string;
+}): Promise<SNBuildResponse> {
+  const { provider, client, atfSuiteSysId, maxRetries, runDir } = opts;
+  let currentBuild = opts.build;
+  let runResult = opts.initialRunResult;
+
+  const { SN_SYSTEM_PROMPT } = await import('../lib/sn-context.js');
+
+  for (let iteration = 1; iteration <= maxRetries; iteration++) {
+    const failures = runResult.testResults.filter(t => t.status !== 'success');
+    if (failures.length === 0) break;
+
+    console.log();
+    printDivider();
+    console.log(`  ${chalk.bold.magenta(`[Optimize ${iteration}/${maxRetries}]`)} ${chalk.red(`${failures.length} test(s) failing`)} — asking LLM to fix...`);
+    printDivider();
+
+    // Summarise failures
+    const failureLines = failures
+      .map(t => `  - "${t.name}": ${t.message ?? 'no details'}`)
+      .join('\n');
+
+    // Include source for all script-bearing artifacts
+    const artifactLines = currentBuild.artifacts
+      .filter(a => a.fields['script'] ?? a.fields['condition'])
+      .map(a => {
+        const name = String(a.fields['name'] ?? '');
+        const script = String(a.fields['script'] ?? '');
+        const condition = String(a.fields['condition'] ?? '');
+        let out = `[${a.type}: ${name}]`;
+        if (script) out += `\nscript:\n${script}`;
+        if (condition) out += `\ncondition:\n${condition}`;
+        return out;
+      })
+      .join('\n\n---\n\n');
+
+    const fixPrompt =
+      `OPTIMIZATION LOOP — Iteration ${iteration} of ${maxRetries}\n\n` +
+      `The following ATF tests failed after deploying the generated artifacts:\n\n` +
+      `FAILING TESTS:\n${failureLines}\n\n` +
+      `CURRENT ARTIFACT CODE:\n${artifactLines}\n\n` +
+      `Your task: analyze the failures, identify root causes, and return corrected artifacts.\n` +
+      `Rules:\n` +
+      `- Return ONLY a JSON object wrapped in a \`\`\`json code fence\n` +
+      `- Use the same schema: { "name": "...", "description": "...", "artifacts": [...] }\n` +
+      `- Only include artifacts that need changes\n` +
+      `- All scripts must be ES5 (var only, no arrow functions, no const/let)\n` +
+      `- Do NOT ask clarifying questions — provide the fix immediately`;
+
+    const messages: LLMMessage[] = [
+      { role: 'system', content: SN_SYSTEM_PROMPT },
+      { role: 'user', content: fixPrompt },
+    ];
+
+    const llmSpinner = ora(`  Calling LLM for fix...`).start();
+    let fixedArtifacts: SNArtifact[];
+    try {
+      const raw = await provider.complete(messages);
+      llmSpinner.stop();
+      const json = extractJSON(raw);
+      const parsed = JSON.parse(json) as Record<string, unknown>;
+      const rawArtifacts = Array.isArray(parsed['artifacts']) ? parsed['artifacts'] : [];
+      fixedArtifacts = rawArtifacts.map((a: unknown) => {
+        const art = a as Record<string, unknown>;
+        const type = String(art['type'] ?? '');
+        let fields: Record<string, unknown>;
+        if (art['fields'] && typeof art['fields'] === 'object' && !Array.isArray(art['fields'])) {
+          fields = art['fields'] as Record<string, unknown>;
+        } else {
+          const { type: _t, ...rest } = art;
+          fields = rest;
+        }
+        return { type, fields } as SNArtifact;
+      });
+    } catch (err) {
+      llmSpinner.fail(chalk.yellow(`  LLM call failed on iteration ${iteration} — stopping optimization`));
+      console.error(chalk.dim(`  ${err instanceof Error ? err.message : String(err)}`));
+      break;
+    }
+
+    // Merge fixed artifacts into current build (replace by type + name, add new ones)
+    const mergedArtifacts = currentBuild.artifacts.map(orig => {
+      const fix = fixedArtifacts.find(
+        f => f.type === orig.type && String(f.fields['name']) === String(orig.fields['name'])
+      );
+      return fix ?? orig;
+    });
+    const addedArtifacts = fixedArtifacts.filter(
+      f => !currentBuild.artifacts.some(
+        orig => orig.type === f.type && String(orig.fields['name']) === String(f.fields['name'])
+      )
+    );
+
+    const updatedBuild: SNBuildResponse = {
+      ...currentBuild,
+      artifacts: [...mergedArtifacts, ...addedArtifacts],
+    };
+
+    // Show which artifacts changed
+    const changed = fixedArtifacts.filter(f =>
+      currentBuild.artifacts.some(
+        orig => orig.type === f.type && String(orig.fields['name']) === String(f.fields['name'])
+      )
+    );
+    if (changed.length > 0) {
+      console.log(`  ${chalk.dim('Patching:')}`);
+      for (const a of changed) {
+        console.log(`    ${chalk.yellow('~')} ${chalk.cyan(a.type.padEnd(16))} ${String(a.fields['name'] ?? '')}`);
+      }
+    }
+
+    // Re-push the updated artifacts
+    const pushSpinner = ora(`  Re-pushing fixed artifacts to instance...`).start();
+    try {
+      await pushArtifacts(client, updatedBuild);
+      pushSpinner.stop();
+    } catch (err) {
+      pushSpinner.fail(chalk.yellow('Re-push failed — stopping optimization'));
+      console.error(chalk.dim(`  ${err instanceof Error ? err.message : String(err)}`));
+      break;
+    }
+
+    // Persist updated manifest to disk
+    const base = slugify(updatedBuild.name);
+    writeFileSync(join(runDir, `${base}.xml`), generateUpdateSetXML(updatedBuild), 'utf-8');
+    writeFileSync(join(runDir, `${base}.manifest.json`), JSON.stringify(updatedBuild, null, 2), 'utf-8');
+
+    // Re-run the existing ATF suite
+    const testSpinner = ora(`  Re-running ATF tests...`).start();
+    try {
+      runResult = await runATFSuite(client, atfSuiteSysId);
+      testSpinner.stop();
+    } catch (err) {
+      testSpinner.fail(chalk.yellow('ATF re-run failed — stopping optimization'));
+      console.error(chalk.dim(`  ${err instanceof Error ? err.message : String(err)}`));
+      break;
+    }
+
+    const passColor = runResult.failed === 0 ? chalk.green : chalk.yellow;
+    console.log(`  ${passColor(`${runResult.passed}/${runResult.total} tests passed`)}`);
+    for (const t of runResult.testResults) {
+      const icon = t.status === 'success' ? chalk.green('✓') : chalk.red('✗');
+      const msg = t.message ? chalk.dim(`  (${t.message})`) : '';
+      console.log(`    ${icon} ${t.name}${msg}`);
+    }
+
+    currentBuild = updatedBuild;
+
+    if (runResult.failed === 0) {
+      console.log();
+      console.log(chalk.green('  ✔ All tests passing after optimization!'));
+      break;
+    }
+  }
+
+  if (runResult.failed > 0) {
+    console.log();
+    console.log(chalk.yellow(`  ⚠ ${runResult.failed} test(s) still failing after ${maxRetries} optimization iteration(s).`));
+    console.log(chalk.dim('  Review the ATF suite in ServiceNow for details.'));
+  }
+
+  return currentBuild;
+}
+
+// ---------------------------------------------------------------------------
 // Command
 // ---------------------------------------------------------------------------
 
@@ -294,6 +470,8 @@ export function factoryCommand(): Command {
     .option('--scope <prefix>', 'Override the application scope prefix (e.g. x_myco_myapp)')
     .option('--skip-tests', 'Skip ATF test generation')
     .option('--run-tests', 'Execute ATF tests on the source instance after generating them')
+    .option('--optimize', 'Auto-fix failing ATF tests via LLM feedback loop (implies --run-tests)')
+    .option('--max-retries <n>', 'Max optimization iterations (used with --optimize)', '3')
     .option('--dry-run', 'Show the plan only — do not build or deploy')
     .option('--resume <id>', 'Resume a previous factory run from its checkpoint')
     .option('--list', 'List recent factory runs and their status')
@@ -304,6 +482,8 @@ export function factoryCommand(): Command {
         scope?: string;
         skipTests?: boolean;
         runTests?: boolean;
+        optimize?: boolean;
+        maxRetries?: string;
         dryRun?: boolean;
         resume?: string;
         list?: boolean;
@@ -543,7 +723,7 @@ export function factoryCommand(): Command {
       }
 
       // Merge all component builds into one combined build
-      const combinedBuild: SNBuildResponse = {
+      let combinedBuild: SNBuildResponse = {
         name: plan.name,
         description: plan.description,
         scope: plan.scope,
@@ -648,7 +828,7 @@ export function factoryCommand(): Command {
               atfResult = null as never;
             }
 
-            if (opts.runTests && atfResult) {
+            if ((opts.runTests || opts.optimize) && atfResult) {
               const runSpinner = ora('  Running ATF tests...').start();
               try {
                 const runResult = await runATFSuite(sourceClient, atfResult.suiteSysId);
@@ -659,6 +839,18 @@ export function factoryCommand(): Command {
                   const icon = t.status === 'success' ? chalk.green('✓') : chalk.red('✗');
                   const msg = t.message ? chalk.dim(`  (${t.message})`) : '';
                   console.log(`    ${icon} ${t.name}${msg}`);
+                }
+
+                if (opts.optimize && runResult.failed > 0) {
+                  combinedBuild = await runOptimizationLoop({
+                    provider,
+                    client: sourceClient,
+                    build: combinedBuild,
+                    atfSuiteSysId: atfResult.suiteSysId,
+                    initialRunResult: runResult,
+                    maxRetries: parseInt(opts.maxRetries ?? '3', 10),
+                    runDir,
+                  });
                 }
               } catch (err) {
                 runSpinner.fail(chalk.yellow('ATF run failed (non-fatal)'));

@@ -89,6 +89,9 @@ snow diff all --against test --scripts --scope x_myco_myapp
 # 11. Run the full factory pipeline: plan → build → test → promote
 snow factory "Build a hardware asset request app with approval workflow" --envs test,prod
 
+# 11b. Run tests and auto-fix failures with the LLM optimization loop
+snow factory "Create a Script Include named SLACalculator with risk level logic" --run-tests --optimize
+
 # 12. Start an interactive session to build iteratively
 snow ai chat
 
@@ -845,6 +848,12 @@ snow factory "Build an incident escalation app" --dry-run
 # Generate and immediately run ATF tests
 snow factory "Build a change approval workflow" --run-tests
 
+# Generate ATF tests, run them, and auto-fix failures with the LLM (up to 3 retries)
+snow factory "Create a priority calculator script include" --run-tests --optimize
+
+# Same, but allow up to 5 fix iterations
+snow factory "Create a priority calculator script include" --run-tests --optimize --max-retries 5
+
 # Skip ATF test generation (faster)
 snow factory "Add a business rule to auto-assign P1 incidents" --skip-tests
 
@@ -863,6 +872,8 @@ snow factory "" --list
 | `--scope <prefix>` | Override the application scope prefix for all artifacts (e.g. `x_myco_myapp`) |
 | `--skip-tests` | Skip ATF test generation |
 | `--run-tests` | Execute the generated ATF test suite immediately after pushing |
+| `--optimize` | After running tests, auto-fix failures via LLM feedback loop (implies `--run-tests`) |
+| `--max-retries <n>` | Max optimization iterations when using `--optimize` (default: `3`) |
 | `--dry-run` | Show the generated plan only — no builds, no deployments |
 | `--resume <id>` | Resume a previous run from its checkpoint (see `--list`) |
 | `--list` | Show recent factory runs and their component completion status |
@@ -886,7 +897,13 @@ snow factory "" --list
   [4/N] Generating ATF tests (unless --skip-tests)
         LLM generates a test suite with server-side script assertions
         Tests pushed to the instance as sys_atf_test + sys_atf_step records
-        Optionally executed if --run-tests is set
+        If --run-tests or --optimize: suite is executed via the CICD API
+        Pass/fail counts and per-test results are displayed
+
+        If --optimize and tests failed:
+          → LLM receives the failing test names + error messages + artifact source
+          → Generates corrected artifacts, re-pushes them, re-runs the suite
+          → Repeats until all pass or --max-retries is exhausted
 
   [5/N] Promoting to <env>  (once per additional env in --envs)
         Checks for pre-existing artifacts on the target
@@ -905,6 +922,40 @@ snow factory "" --resume abc12345     # resume from last successful phase
 ```
 
 The resume prompt argument is ignored when `--resume` is provided — the original prompt and plan are loaded from the checkpoint.
+
+#### Auto-optimization loop
+
+When `--optimize` is set, the factory runs an automated fix cycle after the initial ATF test run. For each iteration:
+
+1. Failing test names and error messages are collected from the `sys_atf_result` table
+2. The current source code of every script-bearing artifact is extracted from the local manifest
+3. A structured fix prompt is sent to the LLM — no questions, just a corrected build
+4. Fixed artifacts are merged into the build (replaced by `type + name`), re-pushed to the instance
+5. The existing ATF suite is re-run; if all tests pass, the loop exits early
+
+```
+  [Optimize 1/3]  2 test(s) failing — asking LLM to fix...
+  ────────────────────────────────────────────────
+  Patching:
+    ~ script_include     SLACalculator
+  Re-pushing fixed artifacts to instance...
+  Re-running ATF tests...
+  3/3 tests passed
+    ✓ Test low risk level
+    ✓ Test medium risk level
+    ✓ Test high risk level
+
+  ✔ All tests passing after optimization!
+```
+
+If failures persist after all retries, a warning is shown and the best-effort build is kept on disk.
+
+**Requirements for ATF test execution:**
+- The `sn_cicd` plugin must be active on the instance
+- The authenticated user must have the `sn_cicd` role
+- ATF must be enabled (`System ATF` → `Properties` → `Enable ATF`)
+
+The optimization loop uses the same LLM provider as the build. Each iteration costs one LLM call, so `--max-retries 3` (default) means at most 3 additional calls beyond the initial build.
 
 #### Example output
 
@@ -968,6 +1019,12 @@ The resume prompt argument is ignored when `--resume` is provided — the origin
     • Test manager notification trigger  (2 steps)
   ✓ Test suite created
     https://dev12345.service-now.com/nav_to.do?uri=sys_atf_test_suite.do?sys_id=...
+  Running ATF tests...
+  4/4 tests passed
+    ✓ Test employee record creation and field defaults
+    ✓ Test OnboardingUtils task generation
+    ✓ Test business rule fires on insert
+    ✓ Test manager notification trigger
 ```
 
 #### Permission-denied errors

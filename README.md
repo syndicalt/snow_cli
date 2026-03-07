@@ -30,7 +30,7 @@ A portable CLI for ServiceNow. Query tables, inspect schemas, edit and search sc
 
 ## Full Documentation
 
-The full documentation is available in the [documentation](https://syndicalt.github.io/snow_cli/). This README provides a quick overview and examples to get started.
+The full documentation is available on the [documentation page](https://syndicalt.github.io/snow_cli/). This README provides a quick overview and examples to get started.
 
 ## Installation
 

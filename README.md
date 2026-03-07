@@ -10,6 +10,9 @@ A portable CLI for ServiceNow. Query tables, inspect schemas, edit script fields
   - [snow schema](#snow-schema)
     - [snow schema map](#snow-schema-map)
   - [snow script](#snow-script)
+  - [snow bulk](#snow-bulk)
+  - [snow user](#snow-user)
+  - [snow attachment](#snow-attachment)
   - [snow provider](#snow-provider)
   - [snow ai](#snow-ai)
 - [Configuration File](#configuration-file)
@@ -330,6 +333,166 @@ snow script list
 4. First found: `code`, `notepad++`, `notepad` (Windows) / `code`, `nvim`, `vim`, `nano`, `vi` (Unix)
 
 Cached scripts are stored in `~/.snow/scripts/`.
+
+#### `snow script search`
+
+Search for a text pattern across script fields in a given app scope. Searches Script Includes, Business Rules, Client Scripts, UI Actions, UI Pages (HTML, client, and server scripts), and Scheduled Jobs.
+
+```bash
+# Find all scripts containing a string
+snow script search x_myapp --contains "GlideRecord('incident')"
+
+# Search only specific tables
+snow script search x_myapp --contains "oldMethod" --tables sys_script_include,sys_script
+
+# Use a JavaScript regex
+snow script search x_myapp --contains "gs\.(log|warn)" --regex
+```
+
+Results show the record name, sys_id, and matching lines with line numbers (up to 5 preview lines per record).
+
+**Options:**
+
+| Flag | Description |
+|---|---|
+| `-c, --contains <pattern>` | Text or regex pattern to search for (required) |
+| `-t, --tables <tables>` | Comma-separated table list (default: all 8 script tables) |
+| `--regex` | Treat `--contains` as a JavaScript regex |
+| `-l, --limit <n>` | Max records per table (default: `500`) |
+
+#### `snow script replace`
+
+Find and replace text across script fields in an app scope. Supports dry-run preview before committing changes.
+
+```bash
+# Preview what would change
+snow script replace x_myapp --find "gs.log" --replace "gs.info" --dry-run
+
+# Replace with confirmation prompt
+snow script replace x_myapp --find "gs.log" --replace "gs.info"
+
+# Replace with regex and skip confirmation
+snow script replace x_myapp --find "GlideRecord\('old_table'\)" --replace "GlideRecord('new_table')" --regex --yes
+
+# Target only specific tables
+snow script replace x_myapp --find "deprecated.util" --replace "NewUtils" --tables sys_script_include
+```
+
+**Options:**
+
+| Flag | Description |
+|---|---|
+| `-f, --find <pattern>` | Text to find (required) |
+| `-r, --replace <text>` | Replacement text (required) |
+| `-t, --tables <tables>` | Comma-separated table list (default: all 8 script tables) |
+| `--regex` | Treat `--find` as a JavaScript regex |
+| `-l, --limit <n>` | Max records per table (default: `500`) |
+| `--dry-run` | Show matches without writing any changes |
+| `--yes` | Skip confirmation prompt |
+
+---
+
+### `snow bulk`
+
+Bulk update multiple records in one command. Fetches matching records, shows a preview, asks for confirmation, then patches each record.
+
+```bash
+# Preview affected records without making changes
+snow bulk update incident -q "active=true^priority=1" --set state=2 --dry-run
+
+# Update with confirmation prompt
+snow bulk update incident -q "active=true^priority=1" --set state=2 --set assigned_to=admin
+
+# Skip confirmation (useful in scripts)
+snow bulk update sys_user -q "department=IT^active=true" --set location=NYC --yes
+
+# Cap the number of records updated
+snow bulk update incident -q "active=true" --set impact=2 --limit 50
+```
+
+**Options:**
+
+| Flag | Description |
+|---|---|
+| `-q, --query <query>` | ServiceNow encoded query to select records (required) |
+| `-s, --set <field=value>` | Field assignment — repeat for multiple fields (required) |
+| `-l, --limit <n>` | Max records to update (default: `200`) |
+| `--dry-run` | Show preview without making changes |
+| `--yes` | Skip confirmation prompt |
+
+The preview table shows the sys_id, display name, and new values for every record that will be updated.
+
+---
+
+### `snow user`
+
+Manage group membership and role assignments for ServiceNow users. Users can be specified by `user_name`, email, display name, or sys_id.
+
+```bash
+# Add a user to a group
+snow user add-to-group john.doe "Network Support"
+snow user add-to-group john.doe@example.com "IT Operations" --yes
+
+# Remove a user from a group
+snow user remove-from-group john.doe "Network Support"
+
+# Assign a role to a user
+snow user assign-role john.doe itil
+
+# Remove a role from a user
+snow user remove-role john.doe itil --yes
+```
+
+Each command resolves the user and target, checks for existing membership/role to prevent duplicates, then prompts for confirmation before making any change.
+
+| Command | Description |
+|---|---|
+| `snow user add-to-group <user> <group>` | Add user to a `sys_user_group` |
+| `snow user remove-from-group <user> <group>` | Remove user from a `sys_user_group` |
+| `snow user assign-role <user> <role>` | Grant a `sys_user_role` to a user |
+| `snow user remove-role <user> <role>` | Revoke a `sys_user_role` from a user |
+
+All subcommands accept `--yes` to skip the confirmation prompt.
+
+---
+
+### `snow attachment`
+
+Download and upload file attachments on ServiceNow records via the Attachment API. Also available as `snow att`.
+
+```bash
+# List attachments on a record
+snow attachment list incident <sys_id>
+snow att ls incident <sys_id>
+
+# Download all attachments to a directory
+snow attachment pull incident <sys_id> --all --out ./downloads
+
+# Download a specific attachment by file name
+snow attachment pull incident <sys_id> --name report.pdf
+
+# Upload a file as an attachment
+snow attachment push incident <sys_id> ./fix-notes.pdf
+
+# Override the auto-detected Content-Type
+snow attachment push incident <sys_id> ./data.bin --type application/octet-stream
+```
+
+**`snow attachment pull` options:**
+
+| Flag | Description |
+|---|---|
+| `-a, --all` | Download all attachments on the record |
+| `-n, --name <file_name>` | Download a specific attachment by its file name |
+| `-o, --out <dir>` | Output directory (default: current directory) |
+
+**`snow attachment push` options:**
+
+| Flag | Description |
+|---|---|
+| `-t, --type <content-type>` | Override the Content-Type header (auto-detected from extension by default) |
+
+Content-Type is inferred from the file extension for common formats (PDF, PNG, JPG, CSV, XML, JSON, ZIP, DOCX, XLSX, etc.). Defaults to `application/octet-stream` for unknown types.
 
 ---
 
@@ -677,7 +840,10 @@ src/
     instance.ts             snow instance
     table.ts                snow table
     schema.ts               snow schema
-    script.ts               snow script
+    script.ts               snow script (pull/push/list/search/replace)
+    bulk.ts                 snow bulk (update)
+    user.ts                 snow user (add-to-group/remove-from-group/assign-role/remove-role)
+    attachment.ts           snow attachment (list/pull/push)
     provider.ts             snow provider
     ai.ts                   snow ai (build, chat, review, push)
   lib/

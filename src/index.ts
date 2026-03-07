@@ -10,6 +10,7 @@ import { bulkCommand } from './commands/bulk.js';
 import { userCommand } from './commands/user.js';
 import { attachmentCommand } from './commands/attachment.js';
 import { updatesetCommand } from './commands/updateset.js';
+import { statusCommand } from './commands/status.js';
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { join, dirname } from 'path';
@@ -75,6 +76,7 @@ program.addCommand(bulkCommand());
 program.addCommand(userCommand());
 program.addCommand(attachmentCommand());
 program.addCommand(updatesetCommand());
+program.addCommand(statusCommand());
 program.addCommand(providerCommand());
 program.addCommand(aiCommand());
 

@@ -14,6 +14,7 @@ A portable CLI for ServiceNow. Query tables, inspect schemas, edit and search sc
   - [snow user](#snow-user)
   - [snow attachment](#snow-attachment)
   - [snow updateset](#snow-updateset)
+  - [snow status](#snow-status)
   - [snow provider](#snow-provider)
   - [snow ai](#snow-ai)
 - [Configuration File](#configuration-file)
@@ -639,6 +640,65 @@ Output shows:
 
 ---
 
+### `snow status`
+
+Print a dashboard-style health and stats overview of the active instance. All sections run in parallel and degrade gracefully to `N/A` when the authenticated user lacks access.
+
+```bash
+snow status
+
+# Omit syslog sections (faster for non-admin users, or when syslog is restricted)
+snow status --no-errors
+```
+
+**Sections:**
+
+| Section | What it shows |
+|---|---|
+| **Instance** | ServiceNow version (`glide.version`), cluster node count and status |
+| **Users** | Total active user count |
+| **Development** | Custom scoped app count, custom table count (`x_` prefix), in-progress update sets (up to 5, with author) |
+| **Syslog errors** | Error count in the last hour + last 3 error messages with timestamps |
+| **Scheduler errors** | Failed scheduled job count in the last 24h + last 3 messages |
+
+**Example output:**
+```
+────────────────────────────────────────────────────
+  snow-cli  ·  dev  (https://dev12345.service-now.com)
+────────────────────────────────────────────────────
+
+  Instance
+  ────────
+  Version               Utah Patch 7
+  Cluster nodes         3 active / 3 total
+
+  Users
+  ─────
+  Active users          1,234
+
+  Development
+  ───────────
+  Custom apps           5
+  Custom tables         34
+  Update sets           2 in progress
+                        • My Feature Branch     admin
+                        • Hotfix-001             dev.user
+
+  Syslog errors  (last hour)
+  ──────────────────────────
+  Error count           3
+                        [10:34:01] Script error in BusinessRule 'Assign P...
+                        [10:22:45] Invalid GlideRecord field: assigne_to
+
+  Scheduler errors  (last 24h)
+  ────────────────────────────
+  Failed jobs           0
+```
+
+> **Note:** Version and cluster node stats require admin access to `sys_properties` and `sys_cluster_state`. Syslog sections require read access to the `syslog` table. Sections that can't be read are shown as `N/A` rather than failing the command.
+
+---
+
 ### `snow provider`
 
 Configure LLM providers used by `snow ai`. API keys and model preferences are stored in `~/.snow/config.json`.
@@ -988,6 +1048,7 @@ src/
     user.ts                 snow user (add-to-group/remove-from-group/assign-role/remove-role)
     attachment.ts           snow attachment (list/pull/push)
     updateset.ts            snow updateset (list/current/set/show/capture/export/apply/diff)
+    status.ts               snow status
     provider.ts             snow provider
     ai.ts                   snow ai (build, chat, review, push)
   lib/

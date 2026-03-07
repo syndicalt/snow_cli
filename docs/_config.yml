@@ -2,6 +2,9 @@ title: snow-cli
 description: A portable CLI for ServiceNow — query tables, manage scripts, diff instances, and generate applications with AI.
 
 remote_theme: just-the-docs/just-the-docs
+color_scheme: dark
+toggle_auto_mode: true
+toggle_color_scheme: dark
 
 url: ""
 

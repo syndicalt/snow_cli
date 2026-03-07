@@ -1,6 +1,6 @@
 # snow-cli
 
-A portable CLI for ServiceNow. Query tables, inspect schemas, edit script fields, and generate complete applications using AI — all from your terminal.
+A portable CLI for ServiceNow. Query tables, inspect schemas, edit and search script fields, bulk-update records, manage users and groups, handle attachments, promote update sets across environments, and generate complete applications using AI — all from your terminal.
 
 - [Installation](#installation)
 - [Quick Start](#quick-start)
@@ -13,6 +13,7 @@ A portable CLI for ServiceNow. Query tables, inspect schemas, edit script fields
   - [snow bulk](#snow-bulk)
   - [snow user](#snow-user)
   - [snow attachment](#snow-attachment)
+  - [snow updateset](#snow-updateset)
   - [snow provider](#snow-provider)
   - [snow ai](#snow-ai)
 - [Configuration File](#configuration-file)
@@ -49,16 +50,32 @@ snow instance add
 # 2. Query a table
 snow table get incident -q "active=true" -l 10 -f "number,short_description,state,assigned_to"
 
-# 3. Configure an AI provider
-snow provider set openai
+# 3. Bulk-update records matching a query
+snow bulk update incident -q "active=true^priority=1" --set assigned_to=admin --dry-run
 
-# 4. Generate a simple feature
+# 4. Pull a script field, edit it locally, push it back
+snow script pull sys_script_include <sys_id> script
+
+# 5. Search for a pattern across all scripts in an app scope
+snow script search x_myapp --contains "GlideRecord('old_table')"
+
+# 6. Manage update sets — list, export, and promote to another instance
+snow updateset list
+snow updateset export "Sprint 42" --out ./updatesets
+snow updateset apply ./sprint-42.xml --target prod
+
+# 7. Add a user to a group or assign a role
+snow user add-to-group john.doe "Network Support"
+snow user assign-role john.doe itil
+
+# 8. Download all attachments from a record
+snow attachment pull incident <sys_id> --all --out ./downloads
+
+# 9. Configure an AI provider and generate a feature
+snow provider set openai
 snow ai build "Create a script include that auto-routes incidents by category and urgency"
 
-# 5. Generate a full scoped application (AI decides scope automatically)
-snow ai build "Build a hardware asset request application with a custom table, approval script include, and assignment business rule"
-
-# 6. Start an interactive session to build iteratively
+# 10. Start an interactive session to build iteratively
 snow ai chat
 ```
 
@@ -496,6 +513,132 @@ Content-Type is inferred from the file extension for common formats (PDF, PNG, J
 
 ---
 
+### `snow updateset`
+
+Manage ServiceNow update sets from the CLI — list, inspect, export, import, and diff. Also available as `snow us`.
+
+| Command | Description |
+|---|---|
+| `snow updateset list` | List update sets on the instance |
+| `snow updateset current` | Show the currently active update set |
+| `snow updateset set <name>` | Set the active update set |
+| `snow updateset show <name>` | Show details and all captured items |
+| `snow updateset capture <name> --add <table:sys_id>` | Add specific records to an update set |
+| `snow updateset export <name>` | Download the update set as an XML file |
+| `snow updateset apply <xml-file>` | Upload an XML file to another instance |
+| `snow updateset diff <set1> <set2>` | Compare captured items between two update sets |
+
+Names or sys_ids are accepted wherever `<name>` appears.
+
+#### `snow updateset list`
+
+```bash
+# All in-progress and complete update sets (default: excludes "ignore")
+snow updateset list
+
+# Filter by state
+snow updateset list --state "in progress"
+snow updateset list --state complete --limit 20
+```
+
+**Options:**
+
+| Flag | Description |
+|---|---|
+| `-s, --state <state>` | Filter by state: `in progress`, `complete`, `ignore` (default: all except `ignore`) |
+| `-l, --limit <n>` | Max results (default: `50`) |
+
+Output columns: **Name**, **State**, **Application** (scope), **Created by**, **Created on**. In-progress sets are highlighted in green; the active set is marked with a ★.
+
+#### `snow updateset current`
+
+```bash
+snow updateset current
+```
+
+Shows the update set that is currently active for the authenticated user (read from `sys_user_preference`). REST API writes go to this update set.
+
+#### `snow updateset set <name>`
+
+```bash
+snow updateset set "Sprint 42 - Incident fixes"
+snow updateset set a1b2c3d4e5f6...   # sys_id also accepted
+```
+
+Stores the selection in `sys_user_preference` so subsequent REST API operations (table updates, script pushes, etc.) are captured into the selected update set.
+
+#### `snow updateset show <name>`
+
+```bash
+snow updateset show "Sprint 42 - Incident fixes"
+snow updateset show "Sprint 42 - Incident fixes" --limit 200
+```
+
+Displays update set metadata followed by a table of every captured item (`sys_update_xml`) with type, action, and target name.
+
+#### `snow updateset capture <name> --add <table:sys_id>`
+
+Force-captures specific records into an update set without modifying them:
+
+```bash
+# Capture a single record
+snow updateset capture "My Update Set" --add sys_script_include:abc123...
+
+# Capture multiple records at once
+snow updateset capture "My Update Set" \
+  --add sys_script_include:abc123... \
+  --add sys_script:def456... \
+  --yes
+```
+
+**How it works:** temporarily activates the target update set for the authenticated user, performs a no-op PATCH on each record to trigger ServiceNow's capture mechanism, then restores the previously active update set. The records themselves are not changed.
+
+#### `snow updateset export <name>`
+
+```bash
+# Export to current directory
+snow updateset export "Sprint 42 - Incident fixes"
+
+# Export to a specific directory
+snow updateset export "Sprint 42 - Incident fixes" --out ./updatesets
+```
+
+Calls `/export_update_set.do` and saves the XML to `<safe-name>.xml`. The file can be imported into any ServiceNow instance using `snow updateset apply` or via the ServiceNow UI.
+
+#### `snow updateset apply <xml-file>`
+
+Import an update set XML into an instance. Creates a **Retrieved Update Set** record that you then load, preview, and commit.
+
+```bash
+# Apply to the active instance
+snow updateset apply ./sprint-42-incident-fixes.xml
+
+# Apply to a different instance by alias
+snow updateset apply ./sprint-42-incident-fixes.xml --target prod
+
+# Skip confirmation
+snow updateset apply ./sprint-42-incident-fixes.xml --target prod --yes
+```
+
+After uploading, the CLI prints the direct link to the Retrieved Update Set record and instructions for the load → preview → commit steps, which must be completed in the ServiceNow UI (or scripted separately).
+
+#### `snow updateset diff <set1> <set2>`
+
+Compare the captured items of two update sets side by side:
+
+```bash
+snow updateset diff "Sprint 42" "Sprint 43"
+snow updateset diff a1b2c3...  b4c5d6...   # sys_ids
+```
+
+Output shows:
+- Items only in the first set (removed in second) — in red
+- Items only in the second set (added in second) — in green
+- Items in both sets, flagged if the action changed (e.g. `INSERT_OR_UPDATE` → `DELETE`) — in yellow
+- A summary line: `3 removed  5 added  1 changed  42 unchanged`
+
+---
+
 ### `snow provider`
 
 Configure LLM providers used by `snow ai`. API keys and model preferences are stored in `~/.snow/config.json`.
@@ -844,6 +987,7 @@ src/
     bulk.ts                 snow bulk (update)
     user.ts                 snow user (add-to-group/remove-from-group/assign-role/remove-role)
     attachment.ts           snow attachment (list/pull/push)
+    updateset.ts            snow updateset (list/current/set/show/capture/export/apply/diff)
     provider.ts             snow provider
     ai.ts                   snow ai (build, chat, review, push)
   lib/

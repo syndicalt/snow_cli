@@ -16,6 +16,7 @@ A portable CLI for ServiceNow. Query tables, inspect schemas, edit and search sc
   - [snow updateset](#snow-updateset)
   - [snow status](#snow-status)
   - [snow diff](#snow-diff)
+  - [snow factory](#snow-factory)
   - [snow provider](#snow-provider)
   - [snow ai](#snow-ai)
 - [Configuration File](#configuration-file)
@@ -81,7 +82,10 @@ snow ai build "Create a script include that auto-routes incidents by category an
 snow diff incident --against prod --fields
 snow diff all --against test --scripts --scope x_myco_myapp
 
-# 11. Start an interactive session to build iteratively
+# 11. Run the full factory pipeline: plan → build → test → promote
+snow factory "Build a hardware asset request app with approval workflow" --envs test,prod
+
+# 12. Start an interactive session to build iteratively
 snow ai chat
 ```
 
@@ -789,6 +793,173 @@ For each script-bearing table, shows scripts **added** (only in target), **remov
 
 ---
 
+### `snow factory`
+
+AI-orchestrated multi-component application pipeline. Takes a natural language description, breaks it into a dependency-ordered build plan, generates each component via LLM, pushes to the source instance, optionally generates and runs ATF tests, then promotes through additional environments.
+
+```bash
+# Plan and build (deploys to active instance only)
+snow factory "Build an employee onboarding app with custom tables, approval workflow, and email notifications"
+
+# Full pipeline: dev → test → prod
+snow factory "Build a hardware asset request app" --envs test,prod
+
+# Preview the plan without building
+snow factory "Build an incident escalation app" --dry-run
+
+# Generate and immediately run ATF tests
+snow factory "Build a change approval workflow" --run-tests
+
+# Skip ATF test generation (faster)
+snow factory "Add a business rule to auto-assign P1 incidents" --skip-tests
+
+# Resume a failed or interrupted run
+snow factory "..." --resume abc12345
+
+# List recent factory runs
+snow factory "" --list
+```
+
+**Options:**
+
+| Flag | Description |
+|---|---|
+| `--envs <aliases>` | Comma-separated instance aliases to promote to after source, in order (e.g. `test,prod`) |
+| `--skip-tests` | Skip ATF test generation |
+| `--run-tests` | Execute the generated ATF test suite immediately after pushing |
+| `--dry-run` | Show the generated plan only — no builds, no deployments |
+| `--resume <id>` | Resume a previous run from its checkpoint (see `--list`) |
+| `--list` | Show recent factory runs and their component completion status |
+
+#### Pipeline phases
+
+```
+  [1/N] Planning
+        LLM analyzes the prompt → structured plan with components, dependencies, risks
+        Displays plan for review → confirm before proceeding
+
+  [2/N] Building components
+        Each component is built sequentially in dependency order
+        Tables first, then script includes, then business rules / client scripts
+        Each component saved to ~/.snow/factory/<run-id>/<component>/
+
+  [3/N] Pushing to <source-instance>
+        All artifacts pushed to the active instance via Table API
+        Creates or updates existing records
+
+  [4/N] Generating ATF tests (unless --skip-tests)
+        LLM generates a test suite with server-side script assertions
+        Tests pushed to the instance as sys_atf_test + sys_atf_step records
+        Optionally executed if --run-tests is set
+
+  [5/N] Promoting to <env>  (once per additional env in --envs)
+        Checks for pre-existing artifacts on the target
+        Confirms before applying
+        Uploads combined update set XML to sys_remote_update_set
+        Prints direct link → then Load → Preview → Commit in the UI
+```
+
+#### Checkpointing and resume
+
+Every factory run is checkpointed to `~/.snow/factory/<run-id>/state.json` after each completed phase. If a run is interrupted (network error, LLM failure, manual cancellation), resume it:
+
+```bash
+snow factory "" --list                 # find the run ID
+snow factory "" --resume abc12345     # resume from last successful phase
+```
+
+The resume prompt argument is ignored when `--resume` is provided — the original prompt and plan are loaded from the checkpoint.
+
+#### Example output
+
+```
+  ────────────────────────────────────────────────────────
+  snow factory  ·  anthropic
+  Source: dev  https://dev12345.service-now.com
+  Pipeline: dev → test → prod
+  ────────────────────────────────────────────────────────
+
+  [1/5] Planning
+  ────────────────────────────────────────────────────────
+  Employee Onboarding App
+  Automates new-hire onboarding with task assignment, document tracking, and notifications
+  scope: x_myco_onboard  v1.0.0
+
+  Components (3) — ~14 artifacts
+  1. Custom Tables          (no deps)
+     Employee and HR document tracking tables
+  2. Script Includes        ← depends on: tables
+     OnboardingUtils class for task generation and notifications
+  3. Business Rules         ← depends on: tables, scripts
+     Auto-assign tasks on employee insert; notify on completion
+
+  ⚠ Risks:
+    • SMTP server must be configured for email notifications
+    • MID Server required for Active Directory sync
+
+  ? Execute factory pipeline? (3 components → dev → test → prod) Yes
+
+  [2/5] Building components
+  ────────────────────────────────────────────────────────
+  ✓ Custom Tables  2 artifacts
+     + table            x_myco_onboard_employee
+     + table            x_myco_onboard_doc
+  ✓ Script Includes  1 artifact
+     + script_include   x_myco_onboard.OnboardingUtils
+  ✓ Business Rules  3 artifacts
+     + business_rule    Auto-Assign Tasks on Insert
+     + business_rule    Notify Manager on Completion
+     + scheduled_job    Weekly Onboarding Report
+
+  ✔ 6 total artifacts combined
+
+  [3/5] Pushing to dev
+  ────────────────────────────────────────────────────────
+  created  Table             x_myco_onboard_employee
+  created  Table             x_myco_onboard_doc
+  created  Script Include    x_myco_onboard.OnboardingUtils
+  created  Business Rule     Auto-Assign Tasks on Insert
+  ...
+  6 pushed, 0 failed
+
+  [4/5] Generating ATF tests
+  ────────────────────────────────────────────────────────
+  Employee Onboarding App — ATF Suite
+  4 tests generated
+    • Test employee record creation and field defaults  (3 steps)
+    • Test OnboardingUtils task generation  (2 steps)
+    • Test business rule fires on insert  (3 steps)
+    • Test manager notification trigger  (2 steps)
+  ✓ Test suite created
+    https://dev12345.service-now.com/nav_to.do?uri=sys_atf_test_suite.do?sys_id=...
+```
+
+#### `snow ai test <path>`
+
+Generate ATF tests for any previously generated build and push them to the active instance. Usable independently of `snow factory`.
+
+```bash
+# Generate and push tests for a build
+snow ai test ./my-build/
+
+# Generate, push, and immediately run
+snow ai test ./my-build/ --run
+
+# Custom suite name
+snow ai test ./my-build/my-build.manifest.json --suite-name "Sprint 42 — Onboarding Tests"
+```
+
+**Options:**
+
+| Flag | Description |
+|---|---|
+| `--run` | Execute the test suite immediately after pushing via the ATF API |
+| `--suite-name <name>` | Override the generated suite name |
+
+Requires access to `sys_atf_step_config`, `sys_atf_test`, `sys_atf_test_suite`, and `sys_atf_step` tables. ATF must be enabled on the instance.
+
+---
+
 ### `snow provider`
 
 Configure LLM providers used by `snow ai`. API keys and model preferences are stored in `~/.snow/config.json`.
@@ -1140,6 +1311,7 @@ src/
     updateset.ts            snow updateset (list/current/set/show/capture/export/apply/diff)
     status.ts               snow status
     diff.ts                 snow diff (cross-instance schema/script comparison)
+    factory.ts              snow factory (AI-orchestrated multi-env app pipeline)
     provider.ts             snow provider
     ai.ts                   snow ai (build, chat, review, push)
   lib/
@@ -1148,6 +1320,7 @@ src/
     llm.ts                  LLM provider abstraction (OpenAI, Anthropic, xAI, Ollama)
     sn-context.ts           ServiceNow system prompt and artifact type definitions
     update-set.ts           XML update set generation and Table API push
+    atf.ts                  ATF test generation and execution utilities
   types/
     index.ts                Shared TypeScript interfaces
 ```

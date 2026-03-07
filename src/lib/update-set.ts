@@ -458,6 +458,8 @@ export interface PushError {
   type: string;
   name: string;
   error: string;
+  /** True when the failure was a 403 permission error (not a data/logic error) */
+  permissionDenied?: boolean;
 }
 
 export interface PushSummary {
@@ -467,9 +469,10 @@ export interface PushSummary {
 
 /**
  * Resolve or create a scoped application on the target instance.
- * Returns the sys_id of the sys_app record.
+ * Returns the sys_id of the sys_app record, or null if creation
+ * failed due to insufficient permissions (403).
  */
-async function resolveOrCreateScope(client: ServiceNowClient, scope: SNScope): Promise<string> {
+async function resolveOrCreateScope(client: ServiceNowClient, scope: SNScope): Promise<string | null> {
   const existing = await client.queryTable('sys_scope', {
     sysparmQuery: `scope=${scope.prefix}`,
     sysparmLimit: 1,
@@ -477,17 +480,28 @@ async function resolveOrCreateScope(client: ServiceNowClient, scope: SNScope): P
   });
   if (existing.length > 0) return String(existing[0].sys_id);
 
-  const created = await client.createRecord('sys_app', {
-    name:              scope.name,
-    scope:             scope.prefix,
-    short_description: scope.name,
-    version:           scope.version,
-    vendor:            scope.vendor ?? '',
-    active:            true,
-    licensable:        false,
-    sys_class_name:    'sys_app',
-  });
-  return String(created.sys_id);
+  try {
+    const created = await client.createRecord('sys_app', {
+      name:              scope.name,
+      scope:             scope.prefix,
+      short_description: scope.name,
+      version:           scope.version,
+      vendor:            scope.vendor ?? '',
+      active:            true,
+      licensable:        false,
+      sys_class_name:    'sys_app',
+    });
+    return String(created.sys_id);
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (errMsg.includes('403')) {
+      // Scope creation requires admin/delegated_developer role.
+      // Degrade gracefully — artifacts will be stamped to global scope but
+      // the XML import will carry the full scoped application record.
+      return null;
+    }
+    throw err;
+  }
 }
 
 /**
@@ -570,13 +584,19 @@ export async function pushArtifacts(
   if (build.scope) {
     try {
       onProgress?.(`  Resolving scope: ${build.scope.prefix}`);
-      scopeSysId = await resolveOrCreateScope(client, build.scope);
-      onProgress?.(`  Scope sys_id: ${scopeSysId}`);
+      const resolved = await resolveOrCreateScope(client, build.scope);
+      if (resolved) {
+        scopeSysId = resolved;
+        onProgress?.(`  Scope sys_id: ${scopeSysId}`);
+      } else {
+        onProgress?.(`  Warning: Could not create scope "${build.scope.prefix}" — admin role required. Artifacts pushed to global scope; use the XML to import the full scoped application.`);
+      }
     } catch (err) {
       errors.push({
         type: 'scope',
         name: build.scope.prefix,
         error: err instanceof Error ? err.message : String(err),
+        permissionDenied: false,
       });
     }
   }
@@ -622,10 +642,13 @@ export async function pushArtifacts(
         }
       }
     } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const isPermission = errMsg.includes('403');
       errors.push({
         type: artifact.type,
         name: artifactName,
-        error: err instanceof Error ? err.message : String(err),
+        error: errMsg,
+        permissionDenied: isPermission,
       });
     }
   }
@@ -660,14 +683,22 @@ async function pushTableArtifact(
   });
 
   let tableSysId: string;
-  if (existingTable.length > 0) {
-    tableSysId = String(existingTable[0].sys_id);
-    await client.updateRecord('sys_db_object', tableSysId, dbObjPayload);
-    results.push({ type: 'Table', name: tableName, sysId: tableSysId, action: 'updated' });
-  } else {
-    const created = await client.createRecord('sys_db_object', dbObjPayload);
-    tableSysId = String(created.sys_id);
-    results.push({ type: 'Table', name: tableName, sysId: tableSysId, action: 'created' });
+  try {
+    if (existingTable.length > 0) {
+      tableSysId = String(existingTable[0].sys_id);
+      await client.updateRecord('sys_db_object', tableSysId, dbObjPayload);
+      results.push({ type: 'Table', name: tableName, sysId: tableSysId, action: 'updated' });
+    } else {
+      const created = await client.createRecord('sys_db_object', dbObjPayload);
+      tableSysId = String(created.sys_id);
+      results.push({ type: 'Table', name: tableName, sysId: tableSysId, action: 'created' });
+    }
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    const hint = errMsg.includes('403')
+      ? ' (requires admin or delegated_developer role — use the update-set XML to import instead)'
+      : '';
+    throw new Error(errMsg + hint);
   }
 
   // Upsert columns
@@ -759,35 +790,53 @@ async function pushDecisionTableArtifact(
     sysparmFields: 'sys_id',
   });
 
+  // Determine action and create/update the parent record.
+  // results.push is deferred to the end so a child-record failure
+  // doesn't produce both a "created" result AND an error entry.
   let decisionSysId: string;
-  if (existing.length > 0) {
-    decisionSysId = String(existing[0].sys_id);
-    await client.updateRecord('sys_decision', decisionSysId, dtPayload);
-    results.push({ type: 'Decision Table', name: dtName, sysId: decisionSysId, action: 'updated' });
+  let action: 'created' | 'updated';
 
-    // Delete existing child records so we can recreate cleanly
-    onProgress?.(`    Removing existing rules for: ${dtName}`);
-    for (const childTable of ['sys_decision_question', 'sys_decision_case']) {
-      const children = await client.queryTable(childTable, {
-        sysparmQuery: `decision=${decisionSysId}`,
-        sysparmFields: 'sys_id',
-        sysparmLimit: 500,
-      });
-      for (const child of children) {
-        await client.deleteRecord(childTable, String(child.sys_id));
+  try {
+    if (existing.length > 0) {
+      decisionSysId = String(existing[0].sys_id);
+      await client.updateRecord('sys_decision', decisionSysId, dtPayload);
+      action = 'updated';
+
+      // Attempt to clean up child records before recreating — failures are non-fatal
+      onProgress?.(`    Removing existing rules for: ${dtName}`);
+      for (const childTable of ['sys_decision_question', 'sys_decision_case']) {
+        try {
+          const children = await client.queryTable(childTable, {
+            sysparmQuery: `decision=${decisionSysId}`,
+            sysparmFields: 'sys_id',
+            sysparmLimit: 500,
+          });
+          for (const child of children) {
+            await client.deleteRecord(childTable, String(child.sys_id)).catch(() => undefined);
+          }
+        } catch {
+          // Table may not be accessible via Table API — skip silently
+        }
       }
+    } else {
+      const created = await client.createRecord('sys_decision', dtPayload);
+      decisionSysId = String(created.sys_id);
+      action = 'created';
     }
-  } else {
-    const created = await client.createRecord('sys_decision', dtPayload);
-    decisionSysId = String(created.sys_id);
-    results.push({ type: 'Decision Table', name: dtName, sysId: decisionSysId, action: 'created' });
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    const hint = errMsg.includes('403')
+      ? ' (requires admin or developer role — use the update-set XML to import instead)'
+      : '';
+    throw new Error(errMsg + hint);
   }
 
-  // Create input columns
+  // Create input columns — each wrapped individually so one failure doesn't abort the rest
   const inputs = Array.isArray(artifact.fields['inputs'])
     ? (artifact.fields['inputs'] as Record<string, unknown>[])
     : [];
   const inputSysIds: Record<string, string> = {};
+  let childWarnings = 0;
 
   for (let i = 0; i < inputs.length; i++) {
     const inp = inputs[i];
@@ -798,11 +847,16 @@ async function pushDecisionTableArtifact(
     };
     if (inp['reference']) qPayload['reference_table'] = String(inp['reference']);
     if (scopeSysId) { qPayload['sys_scope'] = scopeSysId; qPayload['sys_package'] = scopeSysId; }
-    const created = await client.createRecord('sys_decision_question', qPayload);
-    inputSysIds[inpName] = String(created.sys_id);
+    try {
+      const created = await client.createRecord('sys_decision_question', qPayload);
+      inputSysIds[inpName] = String(created.sys_id);
+    } catch (err) {
+      childWarnings++;
+      onProgress?.(`    Warning: could not create decision column "${inpName}" — ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
-  // Create rules
+  // Create rules — each case and its conditions are individually guarded
   const rules = Array.isArray(artifact.fields['rules'])
     ? (artifact.fields['rules'] as Record<string, unknown>[])
     : [];
@@ -814,8 +868,24 @@ async function pushDecisionTableArtifact(
       order: ri * 100, result: String(rule['result'] ?? ''),
     };
     if (scopeSysId) { casePayload['sys_scope'] = scopeSysId; casePayload['sys_package'] = scopeSysId; }
-    const createdCase = await client.createRecord('sys_decision_case', casePayload);
-    const caseSysId = String(createdCase.sys_id);
+
+    let caseSysId: string | null = null;
+    try {
+      const createdCase = await client.createRecord('sys_decision_case', casePayload);
+      caseSysId = String(createdCase.sys_id);
+    } catch (err) {
+      childWarnings++;
+      const errMsg = err instanceof Error ? err.message : String(err);
+      // 400 "Invalid table" means the Decision Builder child tables aren't accessible via Table API —
+      // the parent record is still usable. Suggest using the update-set XML path instead.
+      if (errMsg.includes('Invalid table') || errMsg.includes('400')) {
+        onProgress?.(`    Warning: sys_decision_case is not accessible via Table API on this instance.`);
+        onProgress?.(`    Tip: use the exported update-set XML to import decision table rules via System Update Sets.`);
+      } else {
+        onProgress?.(`    Warning: could not create rule "${rule['label'] ?? ri + 1}" — ${errMsg}`);
+      }
+      continue;
+    }
 
     const conditions = Array.isArray(rule['conditions'])
       ? (rule['conditions'] as Record<string, unknown>[])
@@ -827,9 +897,19 @@ async function pushDecisionTableArtifact(
         operator: String(cond['operator'] ?? '='), value: String(cond['value'] ?? ''),
       };
       if (scopeSysId) { cqPayload['sys_scope'] = scopeSysId; cqPayload['sys_package'] = scopeSysId; }
-      await client.createRecord('sys_decision_case_question', cqPayload);
+      try {
+        await client.createRecord('sys_decision_case_question', cqPayload);
+      } catch {
+        childWarnings++;
+      }
     }
   }
+
+  // Register the parent record result — deferred here so failures above don't create duplicates
+  const label = childWarnings > 0
+    ? `Decision Table (${childWarnings} child record(s) skipped — use XML import for full fidelity)`
+    : 'Decision Table';
+  results.push({ type: label, name: dtName, sysId: decisionSysId, action });
 }
 
 async function pushFlowActionArtifact(
@@ -858,28 +938,46 @@ async function pushFlowActionArtifact(
     sysparmFields: 'sys_id',
   });
 
+  // results.push is deferred to the end to avoid duplicate result + error entries
+  // when child-record creation fails after the parent succeeds.
   let actionSysId: string;
-  if (existing.length > 0) {
-    actionSysId = String(existing[0].sys_id);
-    await client.updateRecord('sys_hub_action_type_definition', actionSysId, actionPayload);
-    results.push({ type: 'Flow Action', name: actionName, sysId: actionSysId, action: 'updated' });
+  let action: 'created' | 'updated';
 
-    // Recreate I/O variables
-    onProgress?.(`    Removing existing variables for: ${actionName}`);
-    for (const childTable of ['sys_hub_action_input', 'sys_hub_action_output']) {
-      const children = await client.queryTable(childTable, {
-        sysparmQuery: `action_type=${actionSysId}`,
-        sysparmFields: 'sys_id',
-        sysparmLimit: 100,
-      });
-      for (const child of children) {
-        await client.deleteRecord(childTable, String(child.sys_id));
+  try {
+    if (existing.length > 0) {
+      actionSysId = String(existing[0].sys_id);
+      await client.updateRecord('sys_hub_action_type_definition', actionSysId, actionPayload);
+      action = 'updated';
+
+      // Remove existing I/O variables before recreating
+      onProgress?.(`    Removing existing variables for: ${actionName}`);
+      for (const childTable of ['sys_hub_action_input', 'sys_hub_action_output']) {
+        try {
+          const children = await client.queryTable(childTable, {
+            sysparmQuery: `action_type=${actionSysId}`,
+            sysparmFields: 'sys_id',
+            sysparmLimit: 100,
+          });
+          for (const child of children) {
+            await client.deleteRecord(childTable, String(child.sys_id)).catch(() => undefined);
+          }
+        } catch {
+          // Non-fatal — child cleanup failure shouldn't block the push
+        }
       }
+    } else {
+      const created = await client.createRecord('sys_hub_action_type_definition', actionPayload);
+      actionSysId = String(created.sys_id);
+      action = 'created';
     }
-  } else {
-    const created = await client.createRecord('sys_hub_action_type_definition', actionPayload);
-    actionSysId = String(created.sys_id);
-    results.push({ type: 'Flow Action', name: actionName, sysId: actionSysId, action: 'created' });
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    // 403 on sys_hub_action_type_definition is a common permissions issue on PDIs and restricted instances.
+    // The Flow Designer / IntegrationHub Installer role is required.
+    const hint = errMsg.includes('403')
+      ? ' (requires Flow Designer / IntegrationHub roles — use the update-set XML to import instead)'
+      : '';
+    throw new Error(errMsg + hint);
   }
 
   const inputs = Array.isArray(artifact.fields['inputs'])
@@ -893,7 +991,11 @@ async function pushFlowActionArtifact(
       type: String(inp['type'] ?? 'string'), mandatory: inp['mandatory'] ? true : false, order: i * 100,
     };
     if (scopeSysId) { inpPayload['sys_scope'] = scopeSysId; inpPayload['sys_package'] = scopeSysId; }
-    await client.createRecord('sys_hub_action_input', inpPayload);
+    try {
+      await client.createRecord('sys_hub_action_input', inpPayload);
+    } catch (err) {
+      onProgress?.(`    Warning: could not create input "${inp['name'] ?? i}" — ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   const outputs = Array.isArray(artifact.fields['outputs'])
@@ -907,6 +1009,13 @@ async function pushFlowActionArtifact(
       type: String(out['type'] ?? 'string'), order: i * 100,
     };
     if (scopeSysId) { outPayload['sys_scope'] = scopeSysId; outPayload['sys_package'] = scopeSysId; }
-    await client.createRecord('sys_hub_action_output', outPayload);
+    try {
+      await client.createRecord('sys_hub_action_output', outPayload);
+    } catch (err) {
+      onProgress?.(`    Warning: could not create output "${out['name'] ?? i}" — ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
+
+  // Register result only after all operations complete (deferred to avoid duplicate result+error)
+  results.push({ type: 'Flow Action', name: actionName, sysId: actionSysId, action });
 }

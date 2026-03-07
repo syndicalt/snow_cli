@@ -1,6 +1,7 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
+import { writeFileSync } from 'fs';
 import { requireActiveInstance, loadConfig } from '../lib/config.js';
 import { ServiceNowClient } from '../lib/client.js';
 
@@ -91,53 +92,100 @@ async function fetchScripts(
   return map;
 }
 
-// Simple unified-diff-style line comparison
-function lineDiff(
-  label: string,
+// ---------------------------------------------------------------------------
+// JSON diff result types
+// ---------------------------------------------------------------------------
+
+interface FieldDiffRow {
+  element: string;
+  status: 'added' | 'removed' | 'changed';
+  detail: string;
+}
+
+interface ScriptDiffEntry {
+  name: string;
+  status: 'added' | 'removed' | 'changed';
+  /** Present when status is 'changed' — array of changed line hunks */
+  hunks?: Array<{ lineStart: number; lineEnd: number; source: string[]; target: string[] }>;
+}
+
+interface DiffResult {
+  source: string;
+  target: string;
+  scope?: string;
+  generatedAt: string;
+  fields?: { table: string; rows: FieldDiffRow[] };
+  scripts?: Array<{ table: string; entries: ScriptDiffEntry[] }>;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Compute line diff hunks between two scripts. Returns null if identical. */
+function computeLineDiff(
   srcScript: string,
-  tgtScript: string,
-  sourceAlias: string,
-  targetAlias: string
-): void {
+  tgtScript: string
+): Array<{ lineStart: number; lineEnd: number; source: string[]; target: string[] }> | null {
   const srcLines = srcScript.split('\n');
   const tgtLines = tgtScript.split('\n');
-
-  // Find first/last differing lines for context
-  let firstDiff = -1;
-  let lastDiff = -1;
   const maxLen = Math.max(srcLines.length, tgtLines.length);
+
+  let firstDiff = -1, lastDiff = -1;
   for (let i = 0; i < maxLen; i++) {
     if (srcLines[i] !== tgtLines[i]) {
       if (firstDiff === -1) firstDiff = i;
       lastDiff = i;
     }
   }
-
-  if (firstDiff === -1) return; // identical
+  if (firstDiff === -1) return null;
 
   const CONTEXT = 2;
   const start = Math.max(0, firstDiff - CONTEXT);
   const end   = Math.min(maxLen - 1, lastDiff + CONTEXT);
 
-  console.log(`\n  ${chalk.bold(label)}`);
-  console.log(`  ${chalk.dim(`--- ${sourceAlias}`)}`);
-  console.log(`  ${chalk.dim(`+++ ${targetAlias}`)}`);
-  console.log(`  ${chalk.dim(`@@ lines ${start + 1}–${end + 1} @@`)}`);
+  return [{
+    lineStart: start + 1,
+    lineEnd:   end + 1,
+    source:    srcLines.slice(start, end + 1),
+    target:    tgtLines.slice(start, end + 1),
+  }];
+}
 
-  for (let i = start; i <= end; i++) {
-    const src = srcLines[i] ?? '';
-    const tgt = tgtLines[i] ?? '';
+// Simple unified-diff-style line comparison (terminal output)
+function lineDiff(
+  label: string,
+  srcScript: string,
+  tgtScript: string,
+  sourceAlias: string,
+  targetAlias: string,
+  out: (line: string) => void
+): void {
+  const hunks = computeLineDiff(srcScript, tgtScript);
+  if (!hunks) return;
+
+  const { lineStart, lineEnd, source, target } = hunks[0];
+
+  out(`\n  ${chalk.bold(label)}`);
+  out(`  ${chalk.dim(`--- ${sourceAlias}`)}`);
+  out(`  ${chalk.dim(`+++ ${targetAlias}`)}`);
+  out(`  ${chalk.dim(`@@ lines ${lineStart}–${lineEnd} @@`)}`);
+
+  const maxLen = Math.max(source.length, target.length);
+  for (let i = 0; i < maxLen; i++) {
+    const src = source[i] ?? '';
+    const tgt = target[i] ?? '';
     if (src === tgt) {
-      console.log(`  ${chalk.dim(' ' + src)}`);
+      out(`  ${chalk.dim(' ' + src)}`);
     } else {
-      if (i < srcLines.length) console.log(`  ${chalk.red('-' + src)}`);
-      if (i < tgtLines.length) console.log(`  ${chalk.green('+' + tgt)}`);
+      if (i < source.length) out(`  ${chalk.red('-' + src)}`);
+      if (i < target.length) out(`  ${chalk.green('+' + tgt)}`);
     }
   }
 }
 
 // ---------------------------------------------------------------------------
-// Field comparison output
+// Field comparison — returns data rows and optionally prints
 // ---------------------------------------------------------------------------
 
 function compareFields(
@@ -146,12 +194,11 @@ function compareFields(
   tgt: Map<string, DictField>,
   sourceAlias: string,
   targetAlias: string,
-  markdownMode: boolean
-): void {
+  markdownMode: boolean,
+  out: (line: string) => void
+): FieldDiffRow[] {
   const allFields = new Set([...src.keys(), ...tgt.keys()]);
-
-  type Row = { element: string; status: string; detail: string };
-  const rows: Row[] = [];
+  const rows: FieldDiffRow[] = [];
 
   for (const el of [...allFields].sort()) {
     const srcF = src.get(el);
@@ -182,44 +229,44 @@ function compareFields(
 
   if (rows.length === 0) {
     if (markdownMode) {
-      console.log(`\n### Schema: \`${table}\``);
-      console.log(`\nNo field differences found.`);
+      out(`\n### Schema: \`${table}\``);
+      out(`\nNo field differences found.`);
     } else {
-      console.log();
-      console.log(chalk.green(`  No field differences in ${table}`));
+      out('');
+      out(chalk.green(`  No field differences in ${table}`));
     }
-    return;
+    return rows;
   }
 
   if (markdownMode) {
-    console.log(`\n### Schema: \`${table}\``);
-    console.log(`\n| Field | Status | Detail |`);
-    console.log(`|-------|--------|--------|`);
+    out(`\n### Schema: \`${table}\``);
+    out(`\n| Field | Status | Detail |`);
+    out(`|-------|--------|--------|`);
     for (const r of rows) {
       const icon = r.status === 'added' ? '➕' : r.status === 'removed' ? '➖' : '✏️';
-      console.log(`| \`${r.element}\` | ${icon} ${r.status} | ${r.detail} |`);
+      out(`| \`${r.element}\` | ${icon} ${r.status} | ${r.detail} |`);
     }
   } else {
-    console.log();
-    console.log(chalk.bold.cyan(`  Schema diff: ${table}`));
-    console.log(chalk.dim(`  ${'─'.repeat(50)}`));
+    out('');
+    out(chalk.bold.cyan(`  Schema diff: ${table}`));
+    out(chalk.dim(`  ${'─'.repeat(50)}`));
 
     const elW = Math.max(8, ...rows.map(r => r.element.length)) + 2;
     const stW = 10;
 
-    console.log(
-      `  ${'Field'.padEnd(elW)}${'Status'.padEnd(stW)}Detail`
-    );
-    console.log(chalk.dim(`  ${'─'.repeat(70)}`));
+    out(`  ${'Field'.padEnd(elW)}${'Status'.padEnd(stW)}Detail`);
+    out(chalk.dim(`  ${'─'.repeat(70)}`));
 
     for (const r of rows) {
       const statusStr =
         r.status === 'added'   ? chalk.green(r.status.padEnd(stW))  :
         r.status === 'removed' ? chalk.red(r.status.padEnd(stW))    :
                                   chalk.yellow(r.status.padEnd(stW));
-      console.log(`  ${r.element.padEnd(elW)}${statusStr}${chalk.dim(r.detail)}`);
+      out(`  ${r.element.padEnd(elW)}${statusStr}${chalk.dim(r.detail)}`);
     }
   }
+
+  return rows;
 }
 
 // ---------------------------------------------------------------------------
@@ -235,12 +282,16 @@ export function diffCommand(): Command {
     .option('--scripts', 'Compare script field content across script-bearing tables')
     .option('--scope <scope>', 'Filter scripts by application scope prefix (e.g. x_myco_myapp)')
     .option('--markdown', 'Output results as Markdown (for pasting into docs/tickets)')
+    .option('--json', 'Output results as JSON (overrides --markdown)')
+    .option('--output <file>', 'Write output to a file instead of stdout')
     .action(async (table: string, opts: {
       against: string;
       fields?: boolean;
       scripts?: boolean;
       scope?: string;
       markdown?: boolean;
+      json?: boolean;
+      output?: string;
     }) => {
       if (!opts.fields && !opts.scripts) {
         console.error(chalk.red('Specify at least one of --fields or --scripts'));
@@ -262,17 +313,38 @@ export function diffCommand(): Command {
       const sourceClient = new ServiceNowClient(sourceInstance);
       const targetClient = new ServiceNowClient(targetInstance);
 
-      if (!opts.markdown) {
-        console.log();
-        console.log(chalk.dim('─'.repeat(52)));
-        console.log(`  ${chalk.bold('snow diff')}  ·  ${chalk.cyan(sourceAlias)} ${chalk.dim('→')} ${chalk.cyan(targetAlias)}`);
-        if (opts.scope) {
-          console.log(`  ${chalk.dim('scope:')} ${opts.scope}`);
+      // When writing to a file, capture all output; otherwise write to stdout
+      const outputLines: string[] = [];
+      const isFileOutput = !!opts.output;
+      const out = (line: string): void => {
+        if (isFileOutput) {
+          outputLines.push(line);
+        } else {
+          console.log(line);
         }
-        console.log(chalk.dim('─'.repeat(52)));
-      } else {
-        console.log(`# snow diff: \`${sourceAlias}\` → \`${targetAlias}\``);
-        if (opts.scope) console.log(`\n**Scope:** \`${opts.scope}\``);
+      };
+
+      // JSON mode — collect structured data and output at the end
+      const jsonResult: DiffResult = {
+        source: sourceAlias,
+        target: targetAlias,
+        scope: opts.scope,
+        generatedAt: new Date().toISOString(),
+      };
+
+      const markdownMode = opts.markdown && !opts.json;
+
+      if (!opts.json) {
+        if (!markdownMode) {
+          out('');
+          out(chalk.dim('─'.repeat(52)));
+          out(`  ${chalk.bold('snow diff')}  ·  ${chalk.cyan(sourceAlias)} ${chalk.dim('→')} ${chalk.cyan(targetAlias)}`);
+          if (opts.scope) out(`  ${chalk.dim('scope:')} ${opts.scope}`);
+          out(chalk.dim('─'.repeat(52)));
+        } else {
+          out(`# snow diff: \`${sourceAlias}\` → \`${targetAlias}\``);
+          if (opts.scope) out(`\n**Scope:** \`${opts.scope}\``);
+        }
       }
 
       // -----------------------------------------------------------------------
@@ -288,7 +360,13 @@ export function diffCommand(): Command {
 
         spinner.stop();
 
-        compareFields(table, srcFields, tgtFields, sourceAlias, targetAlias, opts.markdown ?? false);
+        if (opts.json) {
+          // Collect into JSON result — compareFields with a no-op out
+          const rows = compareFields(table, srcFields, tgtFields, sourceAlias, targetAlias, false, () => undefined);
+          jsonResult.fields = { table, rows };
+        } else {
+          compareFields(table, srcFields, tgtFields, sourceAlias, targetAlias, markdownMode ?? false, out);
+        }
       }
 
       // -----------------------------------------------------------------------
@@ -299,10 +377,12 @@ export function diffCommand(): Command {
           ? SCRIPT_TABLES
           : SCRIPT_TABLES.filter(t => t.table === table);
 
-        if (tables.length === 0) {
-          console.log(chalk.yellow(`  Note: "${table}" is not a known script-bearing table. Script diff skipped.`));
-          console.log(chalk.dim(`  Known script tables: ${SCRIPT_TABLES.map(t => t.table).join(', ')}`));
+        if (tables.length === 0 && !opts.json) {
+          out(chalk.yellow(`  Note: "${table}" is not a known script-bearing table. Script diff skipped.`));
+          out(chalk.dim(`  Known script tables: ${SCRIPT_TABLES.map(t => t.table).join(', ')}`));
         }
+
+        if (opts.json) jsonResult.scripts = [];
 
         for (const { table: tblName, nameField, scriptField } of tables) {
           const spinner = ora(`Fetching scripts from ${tblName}...`).start();
@@ -317,77 +397,98 @@ export function diffCommand(): Command {
           const allNames = new Set([...srcMap.keys(), ...tgtMap.keys()]);
 
           if (allNames.size === 0) {
-            if (!opts.markdown) {
-              console.log(chalk.dim(`\n  No scripts found in ${tblName}`));
-            }
+            if (!opts.json && !markdownMode) out(chalk.dim(`\n  No scripts found in ${tblName}`));
             continue;
           }
 
           const added: string[]   = [];
           const removed: string[] = [];
           const changed: string[] = [];
-          const same: number[]    = [0];
+          let sameCount = 0;
 
           for (const name of [...allNames].sort()) {
             const srcScript = srcMap.get(name);
             const tgtScript = tgtMap.get(name);
 
-            if (!srcScript && tgtScript !== undefined) {
-              added.push(name);
-            } else if (srcScript !== undefined && !tgtScript) {
-              removed.push(name);
-            } else if (srcScript !== tgtScript) {
-              changed.push(name);
-            } else {
-              same[0]++;
-            }
+            if (!srcScript && tgtScript !== undefined)    added.push(name);
+            else if (srcScript !== undefined && !tgtScript) removed.push(name);
+            else if (srcScript !== tgtScript)             changed.push(name);
+            else                                          sameCount++;
           }
 
-          if (opts.markdown) {
-            console.log(`\n### Scripts: \`${tblName}\``);
+          if (opts.json) {
+            const entries: ScriptDiffEntry[] = [
+              ...added.map(n => ({ name: n, status: 'added' as const })),
+              ...removed.map(n => ({ name: n, status: 'removed' as const })),
+              ...changed.map(n => {
+                const hunks = computeLineDiff(srcMap.get(n)!, tgtMap.get(n)!) ?? [];
+                return { name: n, status: 'changed' as const, hunks };
+              }),
+            ];
+            jsonResult.scripts!.push({ table: tblName, entries });
+            continue;
+          }
+
+          if (markdownMode) {
+            out(`\n### Scripts: \`${tblName}\``);
             if (added.length === 0 && removed.length === 0 && changed.length === 0) {
-              console.log(`\nAll ${same[0]} scripts are identical.`);
+              out(`\nAll ${sameCount} scripts are identical.`);
               continue;
             }
-            if (added.length)   console.log(`\n**Added in ${targetAlias}:** ${added.map(n => `\`${n}\``).join(', ')}`);
-            if (removed.length) console.log(`\n**Removed in ${targetAlias}:** ${removed.map(n => `\`${n}\``).join(', ')}`);
+            if (added.length)   out(`\n**Added in ${targetAlias}:** ${added.map(n => `\`${n}\``).join(', ')}`);
+            if (removed.length) out(`\n**Removed in ${targetAlias}:** ${removed.map(n => `\`${n}\``).join(', ')}`);
             if (changed.length) {
-              console.log(`\n**Changed (${changed.length}):**`);
+              out(`\n**Changed (${changed.length}):**`);
               for (const name of changed) {
-                lineDiff(name, srcMap.get(name)!, tgtMap.get(name)!, sourceAlias, targetAlias);
+                lineDiff(name, srcMap.get(name)!, tgtMap.get(name)!, sourceAlias, targetAlias, out);
               }
             }
           } else {
-            console.log();
-            console.log(chalk.bold.cyan(`  Script diff: ${tblName}`));
-            console.log(chalk.dim(`  ${'─'.repeat(50)}`));
+            out('');
+            out(chalk.bold.cyan(`  Script diff: ${tblName}`));
+            out(chalk.dim(`  ${'─'.repeat(50)}`));
 
             if (added.length === 0 && removed.length === 0 && changed.length === 0) {
-              console.log(chalk.green(`  All ${same[0]} scripts are identical.`));
+              out(chalk.green(`  All ${sameCount} scripts are identical.`));
               continue;
             }
 
-            for (const name of added) {
-              console.log(`  ${chalk.green('+')} ${name} ${chalk.dim(`(only in ${targetAlias})`)}`);
-            }
-            for (const name of removed) {
-              console.log(`  ${chalk.red('-')} ${name} ${chalk.dim(`(only in ${sourceAlias})`)}`);
-            }
+            for (const name of added)   out(`  ${chalk.green('+')} ${name} ${chalk.dim(`(only in ${targetAlias})`)}`);
+            for (const name of removed) out(`  ${chalk.red('-')} ${name} ${chalk.dim(`(only in ${sourceAlias})`)}`);
             for (const name of changed) {
-              console.log(`  ${chalk.yellow('~')} ${name}`);
-              lineDiff(name, srcMap.get(name)!, tgtMap.get(name)!, sourceAlias, targetAlias);
+              out(`  ${chalk.yellow('~')} ${name}`);
+              lineDiff(name, srcMap.get(name)!, tgtMap.get(name)!, sourceAlias, targetAlias, out);
             }
-            if (same[0] > 0) {
-              console.log(chalk.dim(`\n  (${same[0]} scripts identical, not shown)`));
-            }
+            if (sameCount > 0) out(chalk.dim(`\n  (${sameCount} scripts identical, not shown)`));
           }
         }
       }
 
-      console.log();
-      if (!opts.markdown) {
-        console.log(chalk.dim('─'.repeat(52)));
-        console.log();
+      // -----------------------------------------------------------------------
+      // Emit output
+      // -----------------------------------------------------------------------
+      if (opts.json) {
+        const jsonStr = JSON.stringify(jsonResult, null, 2);
+        if (opts.output) {
+          writeFileSync(opts.output, jsonStr, 'utf-8');
+          console.log(chalk.green(`✔ JSON diff written to ${opts.output}`));
+        } else {
+          console.log(jsonStr);
+        }
+        return;
+      }
+
+      if (!opts.json && !markdownMode) {
+        out('');
+        out(chalk.dim('─'.repeat(52)));
+        out('');
+      }
+
+      if (isFileOutput) {
+        // Strip ANSI codes from file output for markdown/plain text
+        const plain = outputLines.map(l => l.replace(/\x1B\[[0-9;]*m/g, '')).join('\n');
+        writeFileSync(opts.output!, plain, 'utf-8');
+        console.log(chalk.green(`✔ Diff written to ${opts.output}`));
       }
     });
 

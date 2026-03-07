@@ -12,6 +12,7 @@ import { attachmentCommand } from './commands/attachment.js';
 import { updatesetCommand } from './commands/updateset.js';
 import { statusCommand } from './commands/status.js';
 import { diffCommand } from './commands/diff.js';
+import { factoryCommand } from './commands/factory.js';
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { join, dirname } from 'path';
@@ -79,6 +80,7 @@ program.addCommand(attachmentCommand());
 program.addCommand(updatesetCommand());
 program.addCommand(statusCommand());
 program.addCommand(diffCommand());
+program.addCommand(factoryCommand());
 program.addCommand(providerCommand());
 program.addCommand(aiCommand());
 

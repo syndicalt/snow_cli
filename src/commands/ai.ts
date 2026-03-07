@@ -208,7 +208,7 @@ function printSaveResult(dir: string, build: SNBuildResponse): void {
   console.log(chalk.dim('  Import: System Update Sets → Retrieved Update Sets → Import XML'));
 }
 
-async function doPush(build: SNBuildResponse): Promise<void> {
+async function doPush(build: SNBuildResponse, buildDir?: string): Promise<void> {
   const instance = getActiveInstance();
   if (!instance) {
     console.error(chalk.red('No active instance. Run `snow instance add` first.'));
@@ -223,15 +223,37 @@ async function doPush(build: SNBuildResponse): Promise<void> {
     console.log(chalk.dim(msg))
   );
 
+  const permErrors = summary.errors.filter(e => e.permissionDenied);
+  const realErrors  = summary.errors.filter(e => !e.permissionDenied);
+
   console.log();
   for (const r of summary.results) {
     const action = r.action === 'created' ? chalk.green('created') : chalk.yellow('updated');
-    console.log(`  ${action}  ${r.type.padEnd(16)} ${r.name}  ${chalk.dim(r.sysId)}`);
+    console.log(`  ${action}  ${r.type.padEnd(18)} ${r.name}  ${chalk.dim(r.sysId)}`);
   }
-  for (const e of summary.errors) {
-    console.log(`  ${chalk.red('error')}   ${e.type.padEnd(16)} ${e.name}  ${chalk.red(e.error)}`);
+  for (const e of permErrors) {
+    console.log(`  ${chalk.yellow('skipped')}  ${e.type.padEnd(18)} ${e.name}  ${chalk.dim('(requires elevated permissions)')}`);
   }
-  console.log(chalk.dim(`\n${summary.results.length} pushed, ${summary.errors.length} failed`));
+  for (const e of realErrors) {
+    console.log(`  ${chalk.red('error')}    ${e.type.padEnd(18)} ${e.name}  ${chalk.red(e.error)}`);
+  }
+
+  const summaryParts: string[] = [];
+  if (summary.results.length) summaryParts.push(`${summary.results.length} pushed`);
+  if (permErrors.length)      summaryParts.push(chalk.yellow(`${permErrors.length} require XML import`));
+  if (realErrors.length)      summaryParts.push(chalk.red(`${realErrors.length} failed`));
+  console.log(chalk.dim(`\n${summaryParts.join(', ')}`));
+
+  if (permErrors.length > 0) {
+    const xmlPath = buildDir ? join(buildDir, `${slugify(build.name)}.xml`) : null;
+    console.log();
+    console.log(chalk.yellow('  Some artifacts need admin/developer roles to push via Table API.'));
+    if (xmlPath) {
+      console.log(chalk.dim(`  Import this file in ServiceNow:`));
+      console.log(chalk.white(`    ${xmlPath}`));
+    }
+    console.log(chalk.dim('  In ServiceNow: System Update Sets → Retrieved Update Sets → Import XML → Load → Preview → Commit'));
+  }
 }
 
 /**
@@ -258,7 +280,7 @@ async function confirmPush(build: SNBuildResponse, dir: string, autoPush?: boole
 
   if (shouldPush) {
     console.log();
-    await doPush(build);
+    await doPush(build, dir);
   } else {
     console.log(chalk.dim(`  Run \`snow ai push ${dir}/\` to deploy later.`));
   }
@@ -569,7 +591,7 @@ export function aiCommand(): Command {
       }
 
       const build = JSON.parse(readFileSync(manifestPath, 'utf-8')) as SNBuildResponse;
-      await doPush(build);
+      await doPush(build, dirname(manifestPath));
     });
 
   // snow ai chat — interactive multi-turn build session
@@ -664,7 +686,7 @@ ${chalk.dim('Slash commands:')}
             return;
           }
           rl.pause();
-          await doPush(lastBuild);
+          await doPush(lastBuild, buildDir ?? undefined);
           rl.resume();
           rl.prompt();
           return;
@@ -763,6 +785,101 @@ ${chalk.dim('Slash commands:')}
       build = await runReview(build, buildDir);
       console.log();
       await confirmPush(build, buildDir);
+    });
+
+  // snow ai test <path> — generate ATF tests for a build
+  cmd
+    .command('test <path>')
+    .description('Generate ATF tests for a build and push them to the active instance')
+    .option('--run', 'Execute the test suite immediately after pushing')
+    .option('--suite-name <name>', 'Override the generated suite name')
+    .action(async (path: string, opts: { run?: boolean; suiteName?: string }) => {
+      const manifestPath = resolveManifestPath(path);
+      const build = JSON.parse(readFileSync(manifestPath, 'utf-8')) as SNBuildResponse;
+
+      const instance = getActiveInstance();
+      if (!instance) {
+        console.error(chalk.red('No active instance. Run `snow instance add` first.'));
+        process.exit(1);
+      }
+
+      const { ServiceNowClient } = await import('../lib/client.js');
+      const client = new ServiceNowClient(instance);
+
+      // Verify ATF step config availability
+      const { getServerScriptStepConfig, generateATFTests, pushATFSuite, runATFSuite } = await import('../lib/atf.js');
+      const stepConfigSpinner = ora('Checking ATF step config...').start();
+      const stepConfigSysId = await getServerScriptStepConfig(client);
+      stepConfigSpinner.stop();
+
+      if (!stepConfigSysId) {
+        console.error(chalk.red('Could not find "Run server side script" ATF step config.'));
+        console.error(chalk.dim('ATF may not be enabled on this instance, or the user lacks sys_atf_step_config access.'));
+        process.exit(1);
+      }
+
+      // Generate tests
+      const provider = resolveProvider();
+      const genSpinner = ora(`Generating ATF tests with ${provider.providerName}...`).start();
+      let suite: Awaited<ReturnType<typeof generateATFTests>>;
+      try {
+        suite = await generateATFTests(provider, build);
+        genSpinner.stop();
+      } catch (err) {
+        genSpinner.fail(chalk.red('Test generation failed'));
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+      }
+
+      if (opts.suiteName) suite.name = opts.suiteName;
+
+      // Display generated suite
+      console.log();
+      console.log(chalk.bold(suite.name));
+      if (suite.description) console.log(chalk.dim(suite.description));
+      console.log();
+      for (const t of suite.tests) {
+        console.log(`  ${chalk.green('+')} ${t.name}  ${chalk.dim('(' + t.steps.length + ' steps)')}`);
+        console.log(`     ${chalk.dim(t.short_description)}`);
+      }
+      console.log();
+
+      // Push to instance
+      const pushSpinner = ora(`Pushing ${suite.tests.length} tests to ${instance.alias}...`).start();
+      let pushResult: Awaited<ReturnType<typeof pushATFSuite>>;
+      try {
+        pushResult = await pushATFSuite(client, suite, stepConfigSysId);
+        pushSpinner.stop();
+      } catch (err) {
+        pushSpinner.fail(chalk.red('Failed to push ATF tests'));
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+      }
+
+      console.log(chalk.green(`✔ Test suite created`));
+      console.log(`  ${chalk.dim('Suite sys_id:')} ${pushResult.suiteSysId}`);
+      console.log(`  ${chalk.dim('Tests:')} ${pushResult.testCount}  ${chalk.dim('Steps:')} ${pushResult.stepCount}`);
+      console.log(`  ${chalk.dim(pushResult.suiteUrl)}`);
+
+      // Optionally run
+      if (opts.run) {
+        console.log();
+        const runSpinner = ora('Running test suite...').start();
+        try {
+          const runResult = await runATFSuite(client, pushResult.suiteSysId);
+          runSpinner.stop();
+          const passColor = runResult.failed === 0 ? chalk.green : chalk.red;
+          console.log(passColor(`${runResult.passed}/${runResult.total} tests passed  (${runResult.status})`));
+          for (const t of runResult.testResults) {
+            const icon = t.status === 'success' ? chalk.green('✓') : chalk.red('✗');
+            const msg = t.message ? chalk.dim(`  ${t.message}`) : '';
+            console.log(`  ${icon} ${t.name}${msg}`);
+          }
+        } catch (err) {
+          runSpinner.fail(chalk.red('Test run failed'));
+          console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        }
+      }
     });
 
   // snow ai save-manifest <file.json>

@@ -1,0 +1,13 @@
+<script>
+  // Restore saved theme preference before first paint to avoid flash
+  document.addEventListener('DOMContentLoaded', function () {
+    var saved = localStorage.getItem('snow-cli-theme');
+    if (saved && saved !== 'dark') {
+      jtd.setTheme(saved);
+    }
+    var btn = document.getElementById('theme-toggle');
+    if (btn) {
+      btn.textContent = (saved || 'dark') === 'dark' ? 'Light mode' : 'Dark mode';
+    }
+  });
+</script>

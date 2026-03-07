@@ -1,6 +1,6 @@
 # snow-cli
 
-A portable CLI for ServiceNow. Query tables, inspect schemas, edit and search script fields, bulk-update records, manage users and groups, handle attachments, promote update sets across environments, and generate complete applications using AI — all from your terminal.
+A portable CLI for ServiceNow. Query tables, inspect schemas, edit and search script fields, bulk-update records, manage users and groups, handle attachments, promote update sets across environments, browse the Service Catalog, inspect Flow Designer flows, manage scoped applications, tail system logs, and generate complete applications using AI — all from your terminal.
 
 - [Installation](#installation)
 - [Quick Start](#quick-start)
@@ -17,6 +17,10 @@ A portable CLI for ServiceNow. Query tables, inspect schemas, edit and search sc
   - [snow status](#snow-status)
   - [snow diff](#snow-diff)
   - [snow factory](#snow-factory)
+  - [snow catalog](#snow-catalog)
+  - [snow flow](#snow-flow)
+  - [snow app](#snow-app)
+  - [snow log](#snow-log)
   - [snow provider](#snow-provider)
   - [snow ai](#snow-ai)
 - [Configuration File](#configuration-file)
@@ -87,6 +91,26 @@ snow factory "Build a hardware asset request app with approval workflow" --envs 
 
 # 12. Start an interactive session to build iteratively
 snow ai chat
+
+# 13. Browse the Service Catalog
+snow catalog list
+snow catalog search "VPN"
+snow catalog get "Request VPN Access"
+
+# 14. Inspect Flow Designer flows and actions
+snow flow list
+snow flow list --subflows --scope x_myco_myapp
+snow flow get "My Approval Flow"
+
+# 15. List scoped applications
+snow app list
+snow app get x_myco_myapp
+
+# 16. Tail system logs
+snow log
+snow log --level err --follow
+snow log app --scope x_myco_myapp
+snow log tx --slow 2000
 ```
 
 ---
@@ -724,6 +748,12 @@ snow diff sys_script_include --against prod --fields --scripts
 
 # Output as Markdown (for pasting into docs or tickets)
 snow diff incident --against prod --fields --markdown
+
+# Output as JSON (for scripting or CI pipelines)
+snow diff incident --against prod --fields --scripts --json
+
+# Save the diff report to a file (ANSI stripped automatically)
+snow diff all --against prod --scripts --scope x_myco_myapp --output ./diff-report.txt
 ```
 
 The source is always the **active instance** (`snow instance use <alias>` to set it). `--against` specifies the target instance alias.
@@ -743,6 +773,8 @@ The source is always the **active instance** (`snow instance use <alias>` to set
 | `--scripts` | Compare script field content across script-bearing tables |
 | `--scope <prefix>` | Filter scripts by application scope prefix (e.g. `x_myco_myapp`) |
 | `--markdown` | Output as Markdown for docs/tickets |
+| `--json` | Output structured JSON (fields rows + script hunks) |
+| `--output <file>` | Write the diff to a file (ANSI color codes stripped automatically) |
 
 At least one of `--fields` or `--scripts` is required.
 
@@ -804,6 +836,9 @@ snow factory "Build an employee onboarding app with custom tables, approval work
 # Full pipeline: dev → test → prod
 snow factory "Build a hardware asset request app" --envs test,prod
 
+# Force all artifacts into an existing application scope
+snow factory "Add an approval business rule to the asset request app" --scope x_myco_assetreq
+
 # Preview the plan without building
 snow factory "Build an incident escalation app" --dry-run
 
@@ -825,6 +860,7 @@ snow factory "" --list
 | Flag | Description |
 |---|---|
 | `--envs <aliases>` | Comma-separated instance aliases to promote to after source, in order (e.g. `test,prod`) |
+| `--scope <prefix>` | Override the application scope prefix for all artifacts (e.g. `x_myco_myapp`) |
 | `--skip-tests` | Skip ATF test generation |
 | `--run-tests` | Execute the generated ATF test suite immediately after pushing |
 | `--dry-run` | Show the generated plan only — no builds, no deployments |
@@ -933,6 +969,224 @@ The resume prompt argument is ignored when `--resume` is provided — the origin
   ✓ Test suite created
     https://dev12345.service-now.com/nav_to.do?uri=sys_atf_test_suite.do?sys_id=...
 ```
+
+#### Permission-denied errors
+
+Some artifact types require elevated roles to push via the Table API:
+
+| Artifact | Required role |
+|---|---|
+| `table` (`sys_db_object`) | `admin` or `delegated_developer` |
+| `decision_table` (`sys_decision`) | `admin` or `developer` |
+| `flow_action` (`sys_hub_action_type_definition`) | `flow_designer` + `IntegrationHub` |
+
+When a 403 is encountered the artifact is **skipped** (shown in yellow) rather than failing the whole run. The generated update set XML is always written to disk regardless — use it to import via the UI when Table API access is restricted:
+
+```
+  System Update Sets → Retrieved Update Sets → Import XML → Load → Preview → Commit
+```
+
+---
+
+### `snow catalog`
+
+Browse and search the ServiceNow Service Catalog.
+
+```bash
+# List catalog items
+snow catalog list
+snow catalog list --category "Hardware"
+snow catalog list --catalog "Employee Center" -l 50
+
+# Search by name or description
+snow catalog search "VPN"
+snow catalog search "laptop" --limit 10
+
+# Get details for a specific item (by name or sys_id)
+snow catalog get "Request VPN Access"
+snow catalog get abc1234...
+
+# List catalog categories
+snow catalog categories
+snow catalog categories --catalog "IT Catalog"
+```
+
+**`snow catalog list` options:**
+
+| Flag | Description |
+|---|---|
+| `-q, --query <encoded>` | Encoded query filter |
+| `--category <name>` | Filter by category name |
+| `--catalog <name>` | Filter by catalog title |
+| `-l, --limit <n>` | Max records (default: `25`) |
+| `--json` | Output as JSON |
+
+**`snow catalog search` options:**
+
+| Flag | Description |
+|---|---|
+| `-l, --limit <n>` | Max records (default: `20`) |
+| `--json` | Output as JSON |
+
+**`snow catalog categories` options:**
+
+| Flag | Description |
+|---|---|
+| `--catalog <name>` | Filter by catalog title |
+| `-l, --limit <n>` | Max records (default: `100`) |
+| `--json` | Output as JSON |
+
+Sub-categories are indented based on their depth in the `full_name` hierarchy.
+
+---
+
+### `snow flow`
+
+List and inspect Flow Designer flows, subflows, and custom actions.
+
+```bash
+# List flows
+snow flow list
+snow flow list --scope x_myco_myapp
+snow flow list -l 50
+
+# List subflows instead
+snow flow list --subflows
+snow flow list --subflows --scope x_myco_myapp
+
+# Get details and inputs for a specific flow (by name or sys_id)
+snow flow get "My Approval Flow"
+snow flow get abc1234...
+
+# List custom Flow Designer actions
+snow flow actions
+snow flow actions --scope x_myco_myapp
+```
+
+**`snow flow list` options:**
+
+| Flag | Description |
+|---|---|
+| `--subflows` | Show subflows instead of flows |
+| `--scope <prefix>` | Filter by application scope prefix |
+| `-q, --query <encoded>` | Additional encoded query filter |
+| `-l, --limit <n>` | Max records (default: `25`) |
+| `--json` | Output as JSON |
+
+**`snow flow actions` options:**
+
+| Flag | Description |
+|---|---|
+| `--scope <prefix>` | Filter by application scope prefix |
+| `-q, --query <encoded>` | Additional encoded query filter |
+| `-l, --limit <n>` | Max records (default: `25`) |
+| `--json` | Output as JSON |
+
+`snow flow get` shows flow metadata, trigger type, run-as setting, and the list of typed input variables. It also prints the direct Flow Designer URL for the record.
+
+Active flows are shown with a green `●`; inactive with a red `○`.
+
+---
+
+### `snow app`
+
+List and inspect scoped applications on the active instance.
+
+```bash
+# List custom scoped applications (sys_app)
+snow app list
+
+# Include all system scopes (sys_scope)
+snow app list --all
+
+# Filter with an encoded query
+snow app list -q "vendor=Acme Corp"
+
+# Get details for a specific app by scope prefix or name
+snow app get x_myco_myapp
+snow app get "My Custom App"
+snow app get abc1234...   # sys_id also accepted
+```
+
+**`snow app list` options:**
+
+| Flag | Description |
+|---|---|
+| `--all` | Include all system scopes, not just custom applications |
+| `-q, --query <encoded>` | Encoded query filter |
+| `-l, --limit <n>` | Max records (default: `50`) |
+| `--json` | Output as JSON |
+
+`snow app get` shows scope prefix, sys_id, version, vendor, created/updated dates, and whether the scope has update set entries. It also prints helpful next-step commands for `snow factory` and `snow diff`.
+
+---
+
+### `snow log`
+
+View system and application logs from the active instance.
+
+```bash
+# System log (default subcommand)
+snow log
+snow log system
+snow log --level err
+snow log --source Evaluator --limit 100
+
+# Filter by scope
+snow log --scope x_myco_myapp
+
+# Follow mode — polls for new entries every 5 seconds
+snow log --follow
+snow log --follow --interval 10000
+
+# Application log (requires admin role)
+snow log app
+snow log app --scope x_myco_myapp
+
+# Transaction log
+snow log tx
+snow log tx --slow 2000   # only show responses > 2000ms
+```
+
+#### `snow log system` (default)
+
+Queries the `syslog` table. Output columns: timestamp, level, source, message.
+
+| Flag | Description |
+|---|---|
+| `--level <level>` | Filter by level: `err`, `warn`, `info`, `debug` |
+| `--source <source>` | Filter by log source (e.g. `Evaluator`, `Script`) |
+| `--scope <prefix>` | Filter by application scope prefix |
+| `-q, --query <encoded>` | Additional encoded query filter |
+| `-l, --limit <n>` | Max records (default: `50`) |
+| `--follow` | Poll for new entries (Ctrl+C to stop) |
+| `--interval <ms>` | Polling interval in ms when using `--follow` (default: `5000`) |
+| `--json` | Output as JSON |
+
+#### `snow log app`
+
+Queries the `syslog_app_scope` table, which contains application-level log entries written by `gs.log()`, `gs.warn()`, etc. **Requires the `admin` role** — a clear error is shown if access is denied.
+
+| Flag | Description |
+|---|---|
+| `--scope <prefix>` | Filter by application scope prefix |
+| `--source <source>` | Filter by log source |
+| `-l, --limit <n>` | Max records (default: `50`) |
+| `--follow` | Poll for new entries |
+| `--interval <ms>` | Polling interval in ms (default: `5000`) |
+| `--json` | Output as JSON |
+
+#### `snow log tx`
+
+Queries the `syslog_transaction` table. Output columns: timestamp, HTTP status, response time (highlighted red if > 2s), username, URL.
+
+| Flag | Description |
+|---|---|
+| `-l, --limit <n>` | Max records (default: `25`) |
+| `--slow <ms>` | Only show transactions slower than this many milliseconds |
+| `--json` | Output as JSON |
+
+---
 
 #### `snow ai test <path>`
 
@@ -1312,6 +1566,10 @@ src/
     status.ts               snow status
     diff.ts                 snow diff (cross-instance schema/script comparison)
     factory.ts              snow factory (AI-orchestrated multi-env app pipeline)
+    catalog.ts              snow catalog (Service Catalog browse/search)
+    flow.ts                 snow flow (Flow Designer flows, subflows, actions)
+    app.ts                  snow app (scoped application metadata)
+    log.ts                  snow log (system, app, and transaction logs)
     provider.ts             snow provider
     ai.ts                   snow ai (build, chat, review, push)
   lib/

@@ -52,6 +52,7 @@ interface SecurityData {
     admin_overrides: boolean;
     has_condition: boolean;
     has_script: boolean;
+    script_preview: string;
     required_roles: string[];
   }>;
   business_rules: Array<{
@@ -166,6 +167,7 @@ async function fetchAcls(
   const acls = (await client.queryTable('sys_security_acl', {
     sysparmQuery: queryParts.join('^'),
     sysparmFields: 'sys_id,name,operation,type,active,admin_overrides,condition,script',
+    sysparmDisplayValue: true,
     sysparmLimit: 500,
   })) as unknown as Record<string, unknown>[];
 
@@ -301,7 +303,16 @@ function buildAnalysisPrompt(data: SecurityData, operation?: string): string {
     ? `Focus specifically on the **${operation}** operation.`
     : 'Cover all operations: read, write, create, delete.';
 
-  return `You are a ServiceNow security expert. Analyze whether the user below can access the table described, using the security data provided.
+  // Separate script-bearing ACLs for dedicated section
+  const scriptAcls = data.acls.filter((a) => a.has_script && a.script_preview);
+
+  return `You are a ServiceNow security expert. Analyze whether the user below can access the table described.
+
+**CRITICAL — How ServiceNow ACL evaluation works:**
+- ALL ACLs matching a table+operation combination are evaluated. If ANY single ACL denies access, the user is blocked regardless of other ACLs passing.
+- An ACL with no role requirement listed in the role table is NOT necessarily "open" — it may use a SCRIPT to perform its access check (e.g. \`gs.hasRole('flow_designer')\`). These script-based ACLs are the most common source of invisible restrictions.
+- \`admin_overrides=true\` means admin users bypass that specific ACL. It does NOT make the ACL open to all users.
+- A user with no roles will fail any ACL whose script calls \`gs.hasRole()\` or \`gs.hasRoleExactly()\`.
 
 ${opFocus}
 
@@ -312,7 +323,7 @@ ${opFocus}
 - Direct roles: ${data.user.direct_roles.length ? data.user.direct_roles.join(', ') : '(none)'}
 - Groups: ${data.user.groups.length ? data.user.groups.join(', ') : '(none)'}
 - Group roles: ${data.user.group_roles.length ? [...new Set(data.user.group_roles.map((r) => r.role))].join(', ') : '(none)'}
-- **Effective roles: ${data.user.effective_roles.length ? data.user.effective_roles.join(', ') : '(NONE)'}**
+- **Effective roles: ${data.user.effective_roles.length ? data.user.effective_roles.join(', ') : '(NONE — no roles at all)'}**
 
 ## Table: ${data.table}
 
@@ -323,9 +334,22 @@ ${
     : data.acls
         .map(
           (a) =>
-            `- ${a.operation.toUpperCase()} "${a.name}" — requires roles: [${a.required_roles.length ? a.required_roles.join(', ') : 'NONE (open)'}]${a.has_condition ? ' [has condition]' : ''}${a.has_script ? ' [has script]' : ''}${a.admin_overrides ? ' [admin overrides]' : ''}`
+            `- ${a.operation.toUpperCase()} "${a.name}"` +
+            ` — role table requires: [${a.required_roles.length ? a.required_roles.join(', ') : 'none listed'}]` +
+            (a.has_script ? ' [HAS SCRIPT — see script section below]' : '') +
+            (a.has_condition ? ' [has condition]' : '') +
+            (a.admin_overrides ? ' [admin-overrides]' : '')
         )
         .join('\n')
+}
+
+## ACL Script Content (${scriptAcls.length} script-based ACLs)
+${
+  scriptAcls.length === 0
+    ? '(none)'
+    : scriptAcls
+        .map((a) => `### ${a.operation.toUpperCase()} "${a.name}"\n\`\`\`js\n${a.script_preview}\n\`\`\``)
+        .join('\n\n')
 }
 
 ## Security-relevant Business Rules (${data.business_rules.length})
@@ -338,7 +362,7 @@ ${
             `- "${br.name}" (${br.when}) — triggers: ${Object.entries(br.triggers)
               .filter(([, v]) => v)
               .map(([k]) => k)
-              .join('/')} | script excerpt: ${br.script_preview.replace(/\s+/g, ' ').slice(0, 200)}`
+              .join('/')} | script: ${br.script_preview.replace(/\s+/g, ' ').slice(0, 200)}`
         )
         .join('\n')
 }
@@ -371,13 +395,13 @@ ${
 ---
 
 Please provide:
-1. **Access Summary** — for each operation (read, write, create, delete), state clearly: ALLOWED, DENIED, CONDITIONAL (depends on script/condition logic), or UNKNOWN.
-2. **Effective Role Analysis** — which of the user's roles satisfy (or fail to satisfy) the ACL requirements for each operation.
-3. **Blocking Components** — list each specific security layer that would prevent access, explaining why.
-4. **Open Risks** — note any ACLs with no role requirement (open), which could grant unintended access.
-5. **Recommendations** — practical steps to grant or restrict access if needed.
+1. **Access Summary** — for each operation (read, write, create, delete), state clearly: ALLOWED, DENIED, CONDITIONAL, or UNKNOWN. For CONDITIONAL or UNKNOWN, explain what the script is likely checking based on the script content above.
+2. **Effective Role Analysis** — which of the user's roles satisfy the role-table requirements. Identify which script-based ACLs the user likely fails based on their role set and the script content.
+3. **Blocking Components** — the specific ACL names (and script logic) that would deny this user, with reasoning.
+4. **Open Risks** — any ACLs with no role requirement AND no script (genuinely open to all authenticated users).
+5. **Recommendations** — what role(s) the user needs to gain access.
 
-Be specific. Reference role names, ACL names, and business rule names directly.`;
+Be specific. Reference ACL names and script content directly in your reasoning.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -499,6 +523,7 @@ Examples:
           admin_overrides: bool(a['admin_overrides']),
           has_condition: Boolean(String(a['condition'] ?? '').trim()),
           has_script: Boolean(String(a['script'] ?? '').trim()),
+          script_preview: String(a['script'] ?? '').replace(/\s+/g, ' ').trim().slice(0, 300),
           required_roles: aclRoleMap.get(str(a['sys_id'])) ?? [],
         }));
 
@@ -617,7 +642,42 @@ Examples:
             `    ${chalk.yellow('No ACLs found — table may be open or using parent/global rules.')}`
           );
         } else {
-          const operations = [...new Set(aclsFormatted.map((a) => a.operation))].sort();
+          // Per-operation rollup: ALL ACLs must pass (AND logic)
+          const KNOWN_OPS = ['read', 'write', 'create', 'delete', 'execute'];
+          const operations = [
+            ...KNOWN_OPS.filter((op) => aclsFormatted.some((a) => a.operation === op)),
+            ...[...new Set(aclsFormatted.map((a) => a.operation))]
+              .filter((op) => !KNOWN_OPS.includes(op))
+              .sort(),
+          ];
+
+          console.log();
+          console.log(`  ${chalk.bold('Per-operation verdict')} ${chalk.dim('(all ACLs must pass)')}`);
+          for (const op of operations) {
+            const rules = aclsFormatted.filter((a) => a.operation === op);
+            const hasRoleDenial = rules.some(
+              (r) => r.required_roles.length > 0 && !r.required_roles.some((role) => allRoles.has(role))
+            );
+            const hasScriptOrCondition = rules.some((r) => r.has_script || r.has_condition);
+
+            let verdict: string;
+            if (hasRoleDenial) {
+              verdict = chalk.red('DENIED') + chalk.dim(' (missing required role)');
+            } else if (hasScriptOrCondition) {
+              verdict = chalk.yellow('CONDITIONAL') + chalk.dim(' (script-based ACL — see AI analysis)');
+            } else if (rules.every((r) => r.required_roles.length === 0 && !r.has_script && !r.has_condition)) {
+              verdict = chalk.green('OPEN') + chalk.dim(' (no role or script restrictions)');
+            } else {
+              verdict = chalk.green('LIKELY ALLOWED') + chalk.dim(' (roles satisfied, no scripts)');
+            }
+            console.log(`    ${chalk.dim(op.padEnd(8))} ${verdict}`);
+          }
+
+          console.log();
+          console.log(`  ${chalk.bold('ACL detail')}`);
+          console.log(chalk.dim(`  Note: ACL evaluation uses AND logic — if any ACL below has a [script],`));
+          console.log(chalk.dim(`  that script determines access regardless of the role column.`));
+          console.log();
           for (const op of operations) {
             const rules = aclsFormatted.filter((a) => a.operation === op);
             for (const rule of rules) {
@@ -627,40 +687,38 @@ Examples:
               const uncertain = rule.has_condition || rule.has_script;
 
               let statusIcon: string;
-              if (uncertain && !userMeetsRole) {
+              if (!userMeetsRole) {
                 statusIcon = chalk.red('✗');
               } else if (uncertain) {
-                statusIcon = chalk.yellow('~'); // conditional
+                statusIcon = chalk.yellow('~');
               } else if (rule.required_roles.length === 0) {
-                statusIcon = chalk.yellow('○'); // open (no roles required)
-              } else if (userMeetsRole) {
-                statusIcon = chalk.green('✓');
+                statusIcon = chalk.dim('○');
               } else {
-                statusIcon = chalk.red('✗');
+                statusIcon = chalk.green('✓');
               }
 
               const rolesStr =
                 rule.required_roles.length === 0
-                  ? chalk.yellow('(open)')
+                  ? chalk.dim('(open)')
                   : rule.required_roles
                       .map((r) => (allRoles.has(r) ? chalk.green(r) : chalk.red(r)))
                       .join(', ');
 
               const flags = [
+                rule.has_script ? chalk.yellow('[script]') : '',
                 rule.has_condition ? chalk.dim('[cond]') : '',
-                rule.has_script ? chalk.dim('[script]') : '',
                 rule.admin_overrides ? chalk.dim('[admin-overrides]') : '',
               ]
                 .filter(Boolean)
                 .join(' ');
 
               console.log(
-                `    ${statusIcon} ${chalk.dim(op.padEnd(8))} ${chalk.bold(rule.name.padEnd(32))} ${rolesStr} ${flags}`
+                `    ${statusIcon} ${chalk.dim(op.padEnd(8))} ${rule.name.padEnd(36)} ${rolesStr} ${flags}`
               );
             }
           }
           console.log();
-          console.log(chalk.dim(`    Legend: ${chalk.green('✓')} user has required role  ${chalk.red('✗')} missing role  ${chalk.yellow('~')} conditional  ${chalk.yellow('○')} open`));
+          console.log(chalk.dim(`    Legend: ${chalk.green('✓')} role met  ${chalk.red('✗')} role missing  ${chalk.yellow('~')} script/condition  ${chalk.dim('○')} open`));
         }
 
         // Business rules

@@ -260,6 +260,27 @@ Requires access to `sys_atf_step_config`, `sys_atf_test`, `sys_atf_test_suite`, 
 
 ---
 
+### snow ai save-manifest
+
+Convert a raw LLM JSON response file into a build directory (XML update set + manifest). Useful when an LLM produces a valid JSON artifact response outside of the normal `build` or `chat` flow — for example, when you capture output from your own tooling or directly from an API call.
+
+```bash
+snow ai save-manifest ./raw-llm-response.json
+snow ai save-manifest ./raw-llm-response.json -o ./my-builds/
+```
+
+| Flag | Description |
+|---|---|
+| `-o, --output <dir>` | Output directory (default: current directory) |
+
+**Input format:** The JSON file must contain a valid build response object with `name`, `description`, and `artifacts` array — the same structure the LLM produces during `snow ai build`. Each artifact must have a `type` and either a `fields` object or flat top-level field keys.
+
+**Output:** Creates a directory named after the build (slugified), containing:
+- `<name>.xml` — importable ServiceNow update set
+- `<name>.manifest.json` — artifact list for `snow ai push`
+
+---
+
 ## snow factory
 
 AI-orchestrated multi-component application pipeline. Takes a natural language description, breaks it into a dependency-ordered build plan, generates each component via LLM, pushes to the source instance, optionally generates and runs ATF tests, then promotes through additional environments.

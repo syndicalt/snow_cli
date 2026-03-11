@@ -1084,6 +1084,25 @@ Examples:
         provider = buildProvider(opts.provider, pc.model, pc.apiKey, pc.baseUrl);
       }
 
+      // Map of reference table → best identifier field for querying by display name
+      const refIdentifierField: Record<string, string> = {
+        sys_user: 'user_name',
+        sys_user_group: 'name',
+        core_company: 'name',
+        cmn_location: 'name',
+        cmn_department: 'name',
+        business_unit: 'name',
+        cmdb_ci: 'name',
+        problem: 'number',
+        change_request: 'number',
+        incident: 'number',
+        sc_request: 'number',
+        sc_req_item: 'number',
+        sc_task: 'number',
+        task: 'number',
+        sys_choice: 'label',
+      };
+
       let fieldContext = '';
       if (opts.table) {
         try {
@@ -1098,7 +1117,13 @@ Examples:
             }) as unknown as Array<{ element: string; column_label: string; internal_type: string; reference: string }>;
             if (fields.length > 0) {
               fieldContext = `\n\nAvailable fields on ${opts.table}:\n` +
-                fields.map((f) => `  ${f.element} (${f.internal_type}${f.reference ? ' → ' + f.reference : ''}): "${f.column_label}"`).join('\n');
+                fields.map((f) => {
+                  if (f.internal_type === 'reference' && f.reference) {
+                    const idField = refIdentifierField[f.reference] ?? 'name';
+                    return `  ${f.element} (reference → ${f.reference}, query as ${f.element}.${idField}=...): "${f.column_label}"`;
+                  }
+                  return `  ${f.element} (${f.internal_type}): "${f.column_label}"`;
+                }).join('\n');
             }
           }
         } catch { /* non-fatal — proceed without field context */ }
@@ -1111,12 +1136,20 @@ Rules:
 - Use ^ for AND, ^OR for OR
 - Common operators: = != > < >= <= STARTSWITH ENDSWITH CONTAINS ISEMPTY ISNOTEMPTY IN NOTIN
 - Date macros: javascript:gs.beginningOfToday(), javascript:gs.daysAgo(7), javascript:gs.beginningOfLastWeek()
-- Reference fields: use dot-walking, e.g. assigned_to.user_name=jdoe or assigned_to.department.name=IT
+- CRITICAL — Reference fields: NEVER use field=display_value for reference fields. Always dot-walk to the correct identifier:
+    Groups (sys_user_group): assignment_group.name=..., support_group.name=...
+    Users (sys_user): assigned_to.user_name=..., opened_by.user_name=...
+    Companies/Departments/Locations: company.name=..., department.name=..., location.name=...
+    CIs (cmdb_ci): cmdb_ci.name=...
+    Records (incidents, changes, etc.): parent.number=INC0001
+- If field context is provided, use the "query as field.identifier=..." hint for each reference field
 - Boolean fields: use true/false
 - State values depend on the table — use numeric values when known (e.g. incident state: 1=New, 2=In Progress, 6=Resolved, 7=Closed)
+- Priority: 1=Critical, 2=High, 3=Moderate, 4=Low
 - Empty/null checks: fieldISEMPTY or fieldISNOTEMPTY
 
 Examples:
+  "active P1 incidents assigned to Openspace" → active=true^priority=1^assignment_group.name=Openspace
   "active incidents assigned to nobody" → active=true^assignment_groupISEMPTY^assigned_toISEMPTY^state!=6^state!=7
   "change requests approved in the last week" → state=3^sys_updated_on>=javascript:gs.daysAgo(7)
   "users in IT department" → department.name=IT^active=true`;

@@ -17,6 +17,8 @@ import { catalogCommand } from './commands/catalog.js';
 import { flowCommand } from './commands/flow.js';
 import { appCommand } from './commands/app.js';
 import { logCommand } from './commands/log.js';
+import { runCommand } from './commands/run.js';
+import { sysCommand } from './commands/sys.js';
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { join, dirname } from 'path';
@@ -89,6 +91,8 @@ program.addCommand(catalogCommand());
 program.addCommand(flowCommand());
 program.addCommand(appCommand());
 program.addCommand(logCommand());
+program.addCommand(runCommand());
+program.addCommand(sysCommand());
 program.addCommand(providerCommand());
 program.addCommand(aiCommand());
 

@@ -882,6 +882,173 @@ ${chalk.dim('Slash commands:')}
       }
     });
 
+  // snow ai explain <table> [sys_id]
+  cmd
+    .command('explain <table> [sys_id]')
+    .description('Ask the active LLM to explain a table structure or a specific record in plain English')
+    .option('--provider <name>', 'Override the active provider for this request')
+    .option('--save <file>', 'Save the explanation to a Markdown file')
+    .addHelpText(
+      'after',
+      `
+Examples:
+  snow ai explain incident
+  snow ai explain sys_script_include <sys_id>
+  snow ai explain x_myco_myapp_request
+  snow ai explain sys_script_include <sys_id> --save ./explanation.md
+`
+    )
+    .action(
+      async (
+        table: string,
+        sysId: string | undefined,
+        opts: { provider?: string; save?: string }
+      ) => {
+        const instance = getActiveInstance();
+        if (!instance) {
+          console.error(chalk.red('No active instance. Run `snow instance add` first.'));
+          process.exit(1);
+        }
+
+        let provider = resolveProvider();
+        if (opts.provider) {
+          const { getAIConfig } = await import('../lib/config.js');
+          const ai = getAIConfig();
+          const pc = ai.providers[opts.provider as keyof typeof ai.providers];
+          if (!pc) {
+            console.error(chalk.red(`Provider "${opts.provider}" is not configured.`));
+            process.exit(1);
+          }
+          provider = buildProvider(opts.provider, pc.model, pc.apiKey, pc.baseUrl);
+        }
+
+        const { ServiceNowClient } = await import('../lib/client.js');
+        const client = new ServiceNowClient(instance);
+
+        const spinner = ora('Fetching data from instance…').start();
+
+        let context: string;
+        try {
+          if (!sysId) {
+            // Explain a whole table — fetch metadata + field list
+            const [tableInfoRaw, fieldsRaw] = await Promise.all([
+              client.queryTable('sys_db_object', {
+                sysparmQuery: `name=${table}`,
+                sysparmFields: 'name,label,super_class,sys_scope',
+                sysparmLimit: 1,
+              }),
+              client.queryTable('sys_dictionary', {
+                sysparmQuery: `name=${table}^element!=NULL^elementISNOTEMPTY`,
+                sysparmFields: 'element,column_label,internal_type,max_length,mandatory,reference',
+                sysparmLimit: 200,
+              }),
+            ]);
+
+            const ti = tableInfoRaw[0] as unknown as
+              | { name: string; label: string; super_class: string; sys_scope: string }
+              | undefined;
+
+            const fields = fieldsRaw as unknown as Array<{
+              element: string;
+              column_label: string;
+              internal_type: string;
+              max_length: string;
+              mandatory: string;
+              reference: string;
+            }>;
+
+            const fieldLines = fields
+              .map(
+                (f) =>
+                  `  ${f.element}  (${f.internal_type}${f.reference ? ' → ' + f.reference : ''})` +
+                  `  "${f.column_label}"` +
+                  (f.mandatory === 'true' ? '  [required]' : '')
+              )
+              .join('\n');
+
+            context =
+              `ServiceNow table: ${table}\n` +
+              (ti?.label ? `Label: ${ti.label}\n` : '') +
+              (ti?.super_class ? `Extends: ${ti.super_class}\n` : '') +
+              (ti?.sys_scope ? `Scope: ${ti.sys_scope}\n` : '') +
+              `\nFields (${fields.length}):\n${fieldLines}`;
+          } else {
+            // Explain a specific record
+            const record = await client.getRecord(table, sysId, { sysparmDisplayValue: true });
+
+            // Script field names per table — include full content for these
+            const SCRIPT_FIELDS: Record<string, string[]> = {
+              sys_script_include: ['script'],
+              sys_script: ['script'],
+              sys_ui_action: ['script'],
+              sys_script_client: ['script'],
+              sysauto_script: ['script'],
+              sys_ui_page: ['html', 'client_script', 'processing_script'],
+            };
+            const scriptFields = new Set(SCRIPT_FIELDS[table] ?? []);
+
+            const lines: string[] = [];
+            for (const [key, val] of Object.entries(record)) {
+              if (key === 'sys_id') continue;
+              const strVal = typeof val === 'string' ? val : JSON.stringify(val);
+              if (strVal.length > 300 && !scriptFields.has(key)) {
+                lines.push(`  ${key}: ${strVal.slice(0, 300)}…`);
+              } else {
+                lines.push(`  ${key}: ${strVal}`);
+              }
+            }
+
+            context = `ServiceNow record from table: ${table}\n\n${lines.join('\n')}`;
+          }
+        } catch (err) {
+          spinner.fail(chalk.red('Failed to fetch instance data'));
+          console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+          process.exit(1);
+        }
+
+        spinner.text = `Asking ${provider.providerName} to explain…`;
+
+        const systemPrompt = sysId
+          ? 'You are a ServiceNow expert. Explain the provided record — its purpose, what it does, how it interacts with the platform, and any noteworthy aspects of the code or configuration. Be concise and technical.'
+          : 'You are a ServiceNow expert. Explain the provided table — its business domain, key fields and their meanings, notable relationships to other tables, and typical use cases. Be concise and technical.';
+
+        let explanation: string;
+        try {
+          explanation = await provider.complete([
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: context },
+          ]);
+          spinner.stop();
+        } catch (err) {
+          spinner.fail(chalk.red('LLM request failed'));
+          console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+          process.exit(1);
+        }
+
+        const title = `${table}${sysId ? '  /  ' + sysId : ''}`;
+        console.log();
+        console.log(chalk.bold(title));
+        console.log(chalk.dim('─'.repeat(Math.min(title.length + 4, 72))));
+        console.log();
+        for (const line of explanation.trim().split('\n')) {
+          console.log(line);
+        }
+        console.log();
+
+        if (opts.save) {
+          const { writeFileSync } = await import('fs');
+          const md =
+            `# ${title}\n\n` +
+            `_Explained by ${provider.providerName}_\n\n` +
+            explanation.trim() +
+            '\n';
+          writeFileSync(opts.save, md);
+          console.log(chalk.green(`Saved to ${opts.save}`));
+          console.log();
+        }
+      }
+    );
+
   // snow ai save-manifest <file.json>
   cmd
     .command('save-manifest <jsonFile>')

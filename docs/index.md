@@ -22,6 +22,8 @@ A portable CLI for ServiceNow. Query tables, inspect schemas, edit and search sc
 | [`snow user`](users-attachments#snow-user) | Manage group membership and role assignments |
 | [`snow attachment`](users-attachments#snow-attachment) | Download and upload record attachments |
 | [`snow updateset`](updatesets) | List, export, import, and diff update sets |
+| [`snow run`](admin#snow-run) | Execute a server-side script on the instance |
+| [`snow sys`](admin#snow-sys) | Read and write system properties |
 | [`snow status`](analysis#snow-status) | Dashboard health and stats overview |
 | [`snow diff`](analysis#snow-diff) | Compare schema and scripts between instances |
 | [`snow factory`](ai#snow-factory) | AI-orchestrated multi-component application pipeline |
@@ -31,6 +33,7 @@ A portable CLI for ServiceNow. Query tables, inspect schemas, edit and search sc
 | [`snow log`](browse#snow-log) | Tail system, app, and transaction logs |
 | [`snow provider`](ai#snow-provider) | Configure LLM providers for AI commands |
 | [`snow ai`](ai#snow-ai) | Generate ServiceNow artifacts from natural language |
+| [`snow ai explain`](ai#snow-ai-explain) | Ask the LLM to explain any table or record in plain English |
 
 ---
 

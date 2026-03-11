@@ -1,6 +1,6 @@
 ---
 title: AI & Factory
-nav_order: 10
+nav_order: 11
 ---
 
 # AI & Factory
@@ -393,3 +393,70 @@ System Update Sets → Retrieved Update Sets → Import XML → Load → Preview
 - The `sn_cicd` plugin must be active on the instance
 - The authenticated user must have the `sn_cicd` role
 - ATF must be enabled (System ATF → Properties → Enable ATF)
+
+---
+
+## snow ai explain
+
+Ask the active LLM to explain any ServiceNow table or specific record in plain English. The CLI fetches live schema and record data from the instance, feeds it to the LLM, and prints a concise technical explanation.
+
+```bash
+# Explain what a table is for
+snow ai explain incident
+snow ai explain x_myco_hronboard_request
+snow ai explain sys_user
+
+# Explain a specific record (e.g. a Script Include)
+snow ai explain sys_script_include <sys_id>
+snow ai explain sys_script <sys_id>
+
+# Save the explanation to a Markdown file
+snow ai explain sys_script_include <sys_id> --save ./explanation.md
+
+# Use a specific provider for this request
+snow ai explain incident --provider anthropic
+```
+
+**Options:**
+
+| Flag | Description |
+|---|---|
+| `--provider <name>` | Override the active LLM provider for this request |
+| `--save <file>` | Write the explanation to a Markdown file |
+
+**Table explanation** (`snow ai explain <table>`):
+
+Fetches table metadata from `sys_db_object` (label, parent class, scope) and all field definitions from `sys_dictionary`, then asks the LLM to describe the table's business domain, key fields and their meanings, notable relationships to other tables, and typical use cases.
+
+**Record explanation** (`snow ai explain <table> <sys_id>`):
+
+Fetches the full record with display values. For script-bearing tables (`sys_script_include`, `sys_script`, `sys_ui_action`, `sys_script_client`, `sysauto_script`, `sys_ui_page`), the full script content is included so the LLM can explain what the code does.
+
+**Example output:**
+```
+incident
+────────
+
+The incident table is ServiceNow's core ITSM record type, representing
+unplanned interruptions or reductions in quality of IT services. It
+extends the task table, inheriting fields like number, state, assigned_to,
+short_description, and description.
+
+Key fields:
+  caller_id       → The user who reported the issue
+  category        → High-level classification (Network, Software, Hardware…)
+  urgency / impact → Drive priority via the priority matrix
+  assignment_group → The team responsible for resolution
+  resolved_at      → Populated when state moves to Resolved (6)
+
+Relationships:
+  Extends task (inherits SLA, approval, and activity log machinery)
+  caller_id → sys_user
+  assignment_group → sys_user_group
+  problem_id → problem (root cause linking)
+  change_request → change_request (change causing the incident)
+
+Typical use: Create incidents via the Service Desk, self-service portal,
+email ingest, or API. Drive SLA tracking, escalation rules, and reporting
+through the standard task hierarchy.
+```

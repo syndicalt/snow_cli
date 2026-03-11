@@ -2033,6 +2033,346 @@ Write clearly and accurately based on the actual code. Do not invent functionali
       console.log();
     });
 
+  // ─── snow ai onboard <username> ──────────────────────────────────────────────
+  cmd
+    .command('onboard <username>')
+    .description('Analyse access patterns for comparable users and interactively apply roles to a new user')
+    .option('--no-llm', 'Skip AI recommendation — data-driven analysis only')
+    .option('--provider <name>', 'Override the active LLM provider')
+    .option('-l, --limit <n>', 'Max comparable users to analyse (default: 50)', '50')
+    .addHelpText(
+      'after',
+      `
+Examples:
+  snow ai onboard john.doe
+  snow ai onboard john.doe --no-llm
+  snow ai onboard john.doe --limit 30
+`
+    )
+    .action(async (username: string, opts: { llm: boolean; provider?: string; limit?: string }) => {
+      // Helpers to safely extract value/display_value from any field shape
+      const sv = (f: unknown): string => {
+        if (!f) return '';
+        if (typeof f === 'object' && 'value' in (f as object)) return String((f as { value: unknown }).value);
+        return String(f);
+      };
+      const dv = (f: unknown): string => {
+        if (!f) return '';
+        if (typeof f === 'object' && 'display_value' in (f as object)) return String((f as { display_value: unknown }).display_value);
+        if (typeof f === 'object' && 'value' in (f as object)) return String((f as { value: unknown }).value);
+        return String(f);
+      };
+
+      // Provider setup — only needed for LLM step
+      let provider = opts.llm ? resolveProvider() : null;
+      if (opts.llm && opts.provider) {
+        const { getAIConfig } = await import('../lib/config.js');
+        const ai = getAIConfig();
+        const pc = ai.providers[opts.provider as keyof typeof ai.providers];
+        if (!pc) {
+          console.error(chalk.red(`Provider "${opts.provider}" is not configured.`));
+          process.exit(1);
+        }
+        provider = buildProvider(opts.provider, pc.model, pc.apiKey, pc.baseUrl);
+      }
+
+      const instance = getActiveInstance();
+      if (!instance) {
+        console.error(chalk.red('No active instance. Run: snow instance add'));
+        process.exit(1);
+      }
+      const { ServiceNowClient } = await import('../lib/client.js');
+      const client = new ServiceNowClient(instance);
+      const limit = Math.max(10, parseInt(opts.limit ?? '50', 10));
+
+      // ── 1. Fetch target user ────────────────────────────────────────────────
+      const userSpinner = ora(`Fetching profile for ${username}…`).start();
+      let targetUser: Record<string, unknown>;
+      try {
+        const rows = await client.queryTable('sys_user', {
+          sysparmQuery: `user_name=${username}^active=true`,
+          sysparmFields: 'sys_id,user_name,name,title,department,department.name,manager.name,email',
+          sysparmLimit: 1,
+        }) as unknown as Record<string, unknown>[];
+        userSpinner.stop();
+        if (rows.length === 0) {
+          console.error(chalk.red(`User not found: ${username}`));
+          process.exit(1);
+        }
+        targetUser = rows[0];
+      } catch (err) {
+        userSpinner.fail();
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+      }
+
+      const targetSysId = sv(targetUser['sys_id']);
+      const deptSysId = sv(targetUser['department']);
+      const deptName = String(targetUser['department.name'] ?? dv(targetUser['department']));
+      const titleStr = sv(targetUser['title']);
+      const managerName = String(targetUser['manager.name'] ?? '');
+
+      console.log();
+      console.log(chalk.bold(sv(targetUser['name'])));
+      if (titleStr) console.log(`  ${chalk.dim('Title:')}      ${titleStr}`);
+      if (deptName) console.log(`  ${chalk.dim('Department:')} ${deptName}`);
+      if (managerName) console.log(`  ${chalk.dim('Manager:')}    ${managerName}`);
+      console.log();
+
+      // ── 2. Fetch comparable users ───────────────────────────────────────────
+      const compSpinner = ora('Finding comparable users…').start();
+      let compUsers: Record<string, unknown>[] = [];
+      let searchDescription = '';
+
+      try {
+        // Try dept + title first, fall back to dept-only, then title-only
+        const attempts: Array<{ query: string; desc: string }> = [];
+        if (deptSysId && titleStr) attempts.push({ query: `department=${deptSysId}^title=${titleStr}^active=true^sys_id!=${targetSysId}`, desc: `same department + title (${deptName}, ${titleStr})` });
+        if (deptSysId) attempts.push({ query: `department=${deptSysId}^active=true^sys_id!=${targetSysId}`, desc: `same department (${deptName})` });
+        if (titleStr) attempts.push({ query: `title=${titleStr}^active=true^sys_id!=${targetSysId}`, desc: `same title (${titleStr})` });
+
+        for (const attempt of attempts) {
+          const rows = await client.queryTable('sys_user', {
+            sysparmQuery: attempt.query,
+            sysparmFields: 'sys_id,user_name,name,title',
+            sysparmLimit: limit,
+          }) as unknown as Record<string, unknown>[];
+          if (rows.length >= 3 || (rows.length > compUsers.length && attempt === attempts[attempts.length - 1])) {
+            compUsers = rows;
+            searchDescription = attempt.desc;
+            break;
+          }
+          if (rows.length > compUsers.length) {
+            compUsers = rows;
+            searchDescription = attempt.desc;
+          }
+        }
+        compSpinner.stop();
+      } catch (err) {
+        compSpinner.fail();
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+      }
+
+      if (compUsers.length === 0) {
+        console.log(chalk.yellow('No comparable users found.'));
+        console.log(chalk.dim('  Ensure the user\'s department and title are populated.'));
+        return;
+      }
+      console.log(chalk.dim(`  Found ${compUsers.length} comparable users — ${searchDescription}`));
+      console.log();
+
+      const compSysIds = compUsers.map((u) => sv(u['sys_id'])).filter(Boolean);
+
+      // ── 3. Fetch roles for comparable users + target user's existing roles ──
+      const roleSpinner = ora('Fetching role assignments…').start();
+      let roleRows: Record<string, unknown>[] = [];
+      let existingRoles: Set<string> = new Set();
+      try {
+        [roleRows] = await Promise.all([
+          client.queryTable('sys_user_has_role', {
+            sysparmQuery: `userIN${compSysIds.join(',')}^state=active`,
+            sysparmFields: 'user,role.name',
+            sysparmLimit: 5000,
+          }) as unknown as Promise<Record<string, unknown>[]>,
+        ]);
+        const existingRows = await client.queryTable('sys_user_has_role', {
+          sysparmQuery: `user=${targetSysId}^state=active`,
+          sysparmFields: 'role.name',
+          sysparmLimit: 500,
+        }) as unknown as Record<string, unknown>[];
+        existingRoles = new Set(existingRows.map((r) => String(r['role.name'] ?? '')).filter(Boolean));
+        roleSpinner.stop();
+      } catch (err) {
+        roleSpinner.fail();
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+      }
+
+      // ── 4. Cluster comparable users by their role set ───────────────────────
+      const rolesByUserId = new Map<string, Set<string>>();
+      for (const id of compSysIds) rolesByUserId.set(id, new Set());
+      for (const row of roleRows) {
+        const userId = sv(row['user']);
+        const roleName = String(row['role.name'] ?? '');
+        if (userId && roleName && rolesByUserId.has(userId)) {
+          rolesByUserId.get(userId)!.add(roleName);
+        }
+      }
+
+      const userInfoMap = new Map(compUsers.map((u) => [sv(u['sys_id']), { name: sv(u['name']), username: sv(u['user_name']) }]));
+
+      type Config = { roles: string[]; usernames: string[]; displayNames: string[]; pct: number };
+      const configMap = new Map<string, Config>();
+      for (const [userId, roles] of rolesByUserId) {
+        const key = [...roles].sort().join('\x00');
+        const info = userInfoMap.get(userId);
+        if (!configMap.has(key)) configMap.set(key, { roles: [...roles].sort(), usernames: [], displayNames: [], pct: 0 });
+        configMap.get(key)!.usernames.push(info?.username ?? userId);
+        configMap.get(key)!.displayNames.push(info?.name ?? userId);
+      }
+
+      const configs: Config[] = [...configMap.values()]
+        .sort((a, b) => b.usernames.length - a.usernames.length)
+        .map((c) => ({ ...c, pct: Math.round((c.usernames.length / compUsers.length) * 100) }));
+
+      // ── 5. Display configurations ───────────────────────────────────────────
+      const LABELS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+      const BAR = 20;
+
+      console.log(chalk.bold(`Access Configurations for ${sv(targetUser['name'])}`));
+      console.log(chalk.dim(`  ${compUsers.length} comparable users — ${searchDescription}`));
+      if (existingRoles.size > 0) {
+        console.log(chalk.dim(`  Current roles: ${[...existingRoles].join(', ')}`));
+      }
+      console.log();
+
+      for (let i = 0; i < configs.length; i++) {
+        const c = configs[i];
+        const label = LABELS[i] ?? String(i + 1);
+        const filled = Math.round((c.pct / 100) * BAR);
+        const bar = chalk.green('█'.repeat(filled)) + chalk.dim('░'.repeat(BAR - filled));
+        const newRoles = c.roles.filter((r) => !existingRoles.has(r));
+        const haveRoles = c.roles.filter((r) => existingRoles.has(r));
+
+        console.log(`  ${chalk.bold(label)}  ${bar}  ${chalk.bold(c.pct + '%')}  (${c.usernames.length} user${c.usernames.length !== 1 ? 's' : ''})`);
+        if (c.roles.length === 0) {
+          console.log(`     ${chalk.dim('Roles:  (none)')}`);
+        } else {
+          const roleStr = [
+            ...newRoles.map((r) => chalk.cyan(r)),
+            ...haveRoles.map((r) => chalk.dim(r + ' ✓')),
+          ].join(', ');
+          console.log(`     ${chalk.dim('Roles:')}  ${roleStr}`);
+        }
+        const shown = c.displayNames.slice(0, 4).join(', ');
+        const extra = c.displayNames.length - 4;
+        console.log(`     ${chalk.dim('Users:')}  ${shown}${extra > 0 ? chalk.dim(` +${extra} more`) : ''}`);
+        console.log();
+      }
+
+      if (existingRoles.size > 0) {
+        console.log(chalk.dim('  ✓ = already assigned   cyan = would be added'));
+        console.log();
+      }
+
+      // ── 6. AI recommendation ────────────────────────────────────────────────
+      if (opts.llm && provider && configs.length > 1) {
+        const llmSpinner = ora('Getting AI recommendation…').start();
+        try {
+          const configSummary = configs.slice(0, 6).map((c, i) =>
+            `Config ${LABELS[i]} — ${c.pct}% of comparable users (${c.usernames.length} users)\nRoles: ${c.roles.length > 0 ? c.roles.join(', ') : '(none)'}`
+          ).join('\n\n');
+
+          const rec = await provider.complete([
+            { role: 'system', content: 'You are a ServiceNow access management expert. Apply the principle of least privilege. Be concise — 2-3 sentences max.' },
+            { role: 'user', content: `New user: ${sv(targetUser['name'])}\nTitle: ${titleStr}\nDepartment: ${deptName}\n\n${configSummary}\n\nWhich configuration is most appropriate and why?` },
+          ]);
+          llmSpinner.stop();
+          console.log(chalk.bold('AI Recommendation'));
+          console.log(chalk.dim('─'.repeat(60)));
+          for (const line of rec.trim().split('\n')) console.log(`  ${line}`);
+          console.log();
+        } catch {
+          llmSpinner.fail(chalk.dim('AI recommendation unavailable — proceeding without it'));
+          console.log();
+        }
+      }
+
+      // ── 7. Interactive selection ─────────────────────────────────────────────
+      const { select, confirm } = await import('@inquirer/prompts');
+
+      const choices = configs.slice(0, 8).map((c, i) => {
+        const label = LABELS[i] ?? String(i + 1);
+        const newRoles = c.roles.filter((r) => !existingRoles.has(r));
+        const rolePreview = c.roles.slice(0, 4).join(', ') + (c.roles.length > 4 ? ` … +${c.roles.length - 4} more` : '');
+        const alreadySuffix = newRoles.length === 0 && existingRoles.size > 0 ? ' (already has all)' : '';
+        return {
+          name: `Config ${label} — ${c.pct}% match (${c.usernames.length} users): ${c.roles.length === 0 ? '(no roles)' : rolePreview}${alreadySuffix}`,
+          value: i,
+        };
+      });
+      choices.push({ name: 'Skip — do not assign any roles', value: -1 });
+
+      let selected: number;
+      try {
+        selected = await select({ message: `Apply a configuration to ${sv(targetUser['name'])}?`, choices });
+      } catch {
+        console.log(chalk.dim('\nAborted.'));
+        return;
+      }
+
+      if (selected === -1) {
+        console.log(chalk.dim('No roles assigned.'));
+        return;
+      }
+
+      const chosen = configs[selected];
+      const toAssign = chosen.roles.filter((r) => !existingRoles.has(r));
+
+      if (toAssign.length === 0) {
+        console.log(chalk.yellow(`${sv(targetUser['name'])} already has all roles in this configuration.`));
+        return;
+      }
+
+      console.log();
+      console.log(chalk.bold(`Roles to assign (${toAssign.length}):`));
+      for (const r of toAssign) console.log(`  ${chalk.cyan('+')} ${r}`);
+      console.log();
+
+      let confirmed: boolean;
+      try {
+        confirmed = await confirm({ message: `Assign ${toAssign.length} role(s) to ${sv(targetUser['name'])}?`, default: true });
+      } catch {
+        console.log(chalk.dim('Aborted.'));
+        return;
+      }
+      if (!confirmed) { console.log(chalk.dim('Aborted.')); return; }
+
+      // ── 8. Lookup role sys_ids and assign ────────────────────────────────────
+      const lookupSpinner = ora('Looking up role records…').start();
+      let roleDefs: Record<string, unknown>[];
+      try {
+        roleDefs = await client.queryTable('sys_user_role', {
+          sysparmQuery: `nameIN${toAssign.join(',')}`,
+          sysparmFields: 'sys_id,name',
+          sysparmLimit: 200,
+        }) as unknown as Record<string, unknown>[];
+        lookupSpinner.stop();
+      } catch (err) {
+        lookupSpinner.fail();
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+      }
+
+      const roleDefMap = new Map(roleDefs.map((r) => [sv(r['name']), sv(r['sys_id'])]));
+      let assigned = 0;
+      let failed = 0;
+
+      for (const roleName of toAssign) {
+        const roleSysId = roleDefMap.get(roleName);
+        if (!roleSysId) {
+          console.log(chalk.yellow(`  ? Role not found: ${roleName}`));
+          failed++;
+          continue;
+        }
+        const assignSpinner = ora(`  ${roleName}…`).start();
+        try {
+          await client.createRecord('sys_user_has_role', { user: targetSysId, role: roleSysId, state: 'active' });
+          assignSpinner.succeed(chalk.green(`  ✓ ${roleName}`));
+          assigned++;
+        } catch (err) {
+          assignSpinner.fail(chalk.red(`  ✗ ${roleName}: ${err instanceof Error ? err.message : String(err)}`));
+          failed++;
+        }
+      }
+
+      console.log();
+      if (assigned > 0) console.log(chalk.green(`✔ Assigned ${assigned} role(s) to ${sv(targetUser['name'])}`));
+      if (failed > 0) console.log(chalk.yellow(`  ${failed} role(s) could not be assigned — check permissions or role names`));
+      console.log();
+    });
+
   // snow ai save-manifest <file.json>
   cmd
     .command('save-manifest <jsonFile>')

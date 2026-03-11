@@ -636,6 +636,80 @@ snow ai impact incident --field priority --save ./impact-report.md
 
 ---
 
+## snow ai onboard
+
+Analyse access patterns for users comparable to a new hire and interactively apply roles. Finds users with the same department and/or title, clusters them by their current role set, presents configurations ranked by match percentage, optionally asks the LLM to recommend the best fit, then lets you apply one with a single confirmation.
+
+```bash
+# Full flow with AI recommendation
+snow ai onboard john.doe
+
+# Skip AI step — data-driven configurations only
+snow ai onboard john.doe --no-llm
+
+# Analyse against more comparable users
+snow ai onboard john.doe --limit 100
+```
+
+| Flag | Description |
+|---|---|
+| `--no-llm` | Skip AI recommendation — show data-driven configurations only |
+| `--provider <name>` | Override the active LLM provider |
+| `-l, --limit <n>` | Max comparable users to analyse (default: 50) |
+
+**Flow:**
+
+1. **Profile** — fetches the target user's name, title, department, and manager
+2. **Comparable users** — searches for active users with the same department + title; falls back to department-only, then title-only if fewer than 3 matches are found
+3. **Role clustering** — fetches all active role assignments for comparable users in a single batch query; groups users by identical role set
+4. **Configuration display** — shows each cluster with a match bar, percentage, role list (cyan = would be added, ✓ = already has), and up to 4 example user names
+5. **AI recommendation** — sends the clusters and the new user's title/department to the LLM for a 2-3 sentence recommendation (skipped with `--no-llm`)
+6. **Selection** — interactive menu to pick a configuration or skip
+7. **Execution** — looks up role sys_ids and creates `sys_user_has_role` records; shows ✓ / ✗ per role
+
+**Example output:**
+
+```
+john.doe
+  Title:      IT Analyst
+  Department: Information Technology
+
+  Found 14 comparable users — same department + title
+
+  A  ████████████████░░░░  79%  (11 users)
+     Roles:  itil, catalog_user, sn_incident_read
+     Users:  Alice Smith, Bob Jones, Carol White +8 more
+
+  B  ████░░░░░░░░░░░░░░░░  21%  (3 users)
+     Roles:  itil, catalog_user, sn_incident_read, approver_user
+     Users:  Dave Miller, Eve Wilson, Frank Brown
+
+AI Recommendation
+────────────────────────────────────────────────────────────
+  Config A is the appropriate starting point for an IT Analyst.
+  The approver_user role in Config B should only be assigned
+  once the additional responsibility has been approved.
+
+? Apply a configuration to John Doe?
+> Config A — 79% match (11 users): itil, catalog_user, sn_incident_read
+  Config B — 21% match (3 users): itil, catalog_user, sn_incident_read, approver_user
+  Skip — do not assign any roles
+
+Roles to assign (3):
+  + itil
+  + catalog_user
+  + sn_incident_read
+
+? Assign 3 role(s) to John Doe? Yes
+  ✓ itil
+  ✓ catalog_user
+  ✓ sn_incident_read
+
+✔ Assigned 3 role(s) to John Doe
+```
+
+---
+
 ## snow ai document
 
 Generate comprehensive markdown documentation for a scoped application. Fetches all active artifacts in the scope (script includes, business rules, client scripts, UI actions, scheduled jobs), reads their script content, and asks the LLM to produce a structured developer reference document.

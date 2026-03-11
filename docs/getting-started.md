@@ -203,6 +203,10 @@ snow ai impact incident --field category --save ./impact.md
 # Generate full documentation for a scoped app
 snow ai document x_myco_myapp
 snow ai document x_myco_myapp --out ./docs/myapp.md
+
+# Onboard a new user — analyse comparable users and apply roles interactively
+snow ai onboard john.doe
+snow ai onboard john.doe --no-llm
 ```
 
 ---

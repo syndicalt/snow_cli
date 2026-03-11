@@ -47,6 +47,7 @@ A portable CLI for ServiceNow. Query tables, inspect schemas, edit and search sc
 | [`snow ai audit`](ai#snow-ai-audit) | AI code review of a script record |
 | [`snow ai impact`](ai#snow-ai-impact) | Blast radius analysis for table or field changes |
 | [`snow ai document`](ai#snow-ai-document) | Generate markdown docs for a scoped application |
+| [`snow ai onboard`](ai#snow-ai-onboard) | Role configuration analysis and assignment for new users |
 
 ---
 

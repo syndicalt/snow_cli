@@ -1,8 +1,9 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
-import { requireActiveInstance } from '../lib/config.js';
+import { requireActiveInstance, getActiveProvider } from '../lib/config.js';
 import { ServiceNowClient } from '../lib/client.js';
+import { buildProvider } from '../lib/llm.js';
 
 function str(v: unknown): string {
   if (v === null || v === undefined) return '';
@@ -284,6 +285,159 @@ export function logCommand(): Command {
         spinner.fail(chalk.red('Failed to fetch transaction log'));
         console.error(chalk.red(err instanceof Error ? err.message : String(err)));
         process.exit(1);
+      }
+    });
+
+  // snow log analyze
+  cmd
+    .command('analyze')
+    .description('Fetch recent log errors and use AI to identify patterns, root causes, and fixes')
+    .option('--level <level>', 'Log level to fetch (default: err)', 'err')
+    .option('-l, --limit <n>', 'Number of log entries to analyse', '50')
+    .option('--source <source>', 'Filter by log source')
+    .option('--scope <prefix>', 'Filter by application scope prefix')
+    .option('--provider <name>', 'Override the active LLM provider')
+    .option('--save <file>', 'Save the analysis to a file')
+    .addHelpText(
+      'after',
+      `
+Examples:
+  snow log analyze
+  snow log analyze --limit 100
+  snow log analyze --source Evaluator
+  snow log analyze --scope x_myco_myapp
+  snow log analyze --level warn --limit 75
+  snow log analyze --save ./error-report.md
+`
+    )
+    .action(async (opts: {
+      level: string; limit: string; source?: string;
+      scope?: string; provider?: string; save?: string;
+    }) => {
+      const instance = requireActiveInstance();
+      const client = new ServiceNowClient(instance);
+
+      // ── Fetch log entries ─────────────────────────────────────────────────
+      const spinner = ora(`Fetching ${opts.level} log entries…`).start();
+
+      const parts: string[] = [];
+      parts.push(`level=${opts.level}`);
+      if (opts.source) parts.push(`source=${opts.source}`);
+      if (opts.scope)  parts.push(`sys_scope.scope=${opts.scope}`);
+      parts.push('ORDERBYDESCsys_created_on');
+
+      let logs: Record<string, unknown>[];
+      try {
+        logs = await client.queryTable('syslog', {
+          sysparmQuery: parts.join('^'),
+          sysparmFields: 'sys_id,level,source,message,sys_created_on',
+          sysparmLimit: parseInt(opts.limit, 10),
+          sysparmDisplayValue: true,
+        }) as Record<string, unknown>[];
+        spinner.succeed(`Fetched ${logs.length} log entries.`);
+      } catch (err) {
+        spinner.fail(chalk.red('Failed to fetch log entries'));
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+        return;
+      }
+
+      if (logs.length === 0) {
+        console.log(chalk.dim(`  No ${opts.level} entries found.`));
+        return;
+      }
+
+      // Print a brief preview
+      const DIVIDER = chalk.dim('─'.repeat(72));
+      console.log();
+      console.log(DIVIDER);
+      console.log(`  ${chalk.bold(`${logs.length} log entries`)}  ${chalk.dim(`(${opts.level}  ·  ${instance.alias})`)}`);
+      console.log(DIVIDER);
+      const preview = [...logs].reverse().slice(0, 10);
+      for (const entry of preview) {
+        const ts  = str(entry['sys_created_on']).slice(0, 19).replace('T', ' ');
+        const src = (str(entry['source']) || '—').slice(0, 20).padEnd(20);
+        const msg = str(entry['message']).slice(0, 80);
+        console.log(`  ${chalk.dim(ts)}  ${chalk.dim(src)}  ${msg}`);
+      }
+      if (logs.length > 10) {
+        console.log(chalk.dim(`  … and ${logs.length - 10} more entries`));
+      }
+      console.log();
+
+      // ── LLM analysis ─────────────────────────────────────────────────────
+      const llmProvider = getActiveProvider();
+      if (!llmProvider) {
+        console.log(
+          chalk.yellow('  No LLM provider configured.') +
+          chalk.dim(' Run `snow provider set <name>` to enable AI analysis.')
+        );
+        return;
+      }
+
+      let provider = buildProvider(
+        llmProvider.name,
+        llmProvider.config.model,
+        llmProvider.config.apiKey,
+        llmProvider.config.baseUrl
+      );
+
+      if (opts.provider) {
+        const { getAIConfig } = await import('../lib/config.js');
+        const ai = getAIConfig();
+        const pc = ai.providers[opts.provider as keyof typeof ai.providers];
+        if (!pc) {
+          console.error(chalk.red(`Provider "${opts.provider}" is not configured.`));
+          process.exit(1);
+          return;
+        }
+        provider = buildProvider(opts.provider, pc.model, pc.apiKey, pc.baseUrl);
+      }
+
+      // Format logs for the prompt — reverse so oldest-first for readability
+      const logText = [...logs].reverse()
+        .map((e) => `[${str(e['sys_created_on']).slice(0, 19)}] [${str(e['source'])}] ${str(e['message'])}`)
+        .join('\n');
+
+      const systemPrompt = `You are a ServiceNow platform expert specialising in diagnosing runtime errors and log patterns.
+
+Your task is to analyse a batch of ServiceNow system log entries and produce a structured diagnostic report. Focus on:
+1. Identifying recurring error patterns and grouping related errors together
+2. Diagnosing the root cause of each distinct error category
+3. Recommending specific fixes (code changes, configuration, permissions, etc.)
+4. Flagging any critical or high-severity issues that need immediate attention
+
+Use markdown formatting. Be specific — reference the source, script names, and error messages directly. Prioritise by severity and frequency.`;
+
+      const userPrompt = `Analyse these ${logs.length} ServiceNow ${opts.level} log entries from instance "${instance.alias}"` +
+        (opts.scope ? ` (scope: ${opts.scope})` : '') + ':\n\n' + logText;
+
+      const llmSpinner = ora(`Analysing with ${provider.providerName}…`).start();
+      let analysis: string;
+      try {
+        analysis = await provider.complete([
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ]);
+        llmSpinner.succeed('Analysis complete.');
+      } catch (err) {
+        llmSpinner.fail(chalk.red('LLM request failed'));
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        return;
+      }
+
+      console.log();
+      for (const line of analysis.trim().split('\n')) {
+        console.log(line);
+      }
+      console.log();
+
+      if (opts.save) {
+        const { writeFileSync } = await import('fs');
+        const header = `# Log Analysis — ${instance.alias}\n\nLevel: ${opts.level}  ·  Entries: ${logs.length}  ·  Generated: ${new Date().toISOString()}\n\n---\n\n`;
+        writeFileSync(opts.save, header + analysis.trim() + '\n');
+        console.log(chalk.dim(`  Analysis saved to ${opts.save}`));
+        console.log();
       }
     });
 

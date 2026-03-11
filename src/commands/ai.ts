@@ -1049,6 +1049,363 @@ Examples:
       }
     );
 
+  // snow ai query "<natural language>"
+  cmd
+    .command('query <description...>')
+    .description('Translate a natural language description into a ServiceNow encoded query string')
+    .option('-t, --table <table>', 'Table name — provides field context to improve accuracy')
+    .option('--run', 'Execute the generated query against the active instance (requires --table)')
+    .option('-l, --limit <n>', 'Max records to return when using --run (default: 20)')
+    .option('-f, --fields <fields>', 'Comma-separated fields to return when using --run')
+    .option('--json', 'Output raw JSON when using --run')
+    .option('--provider <name>', 'Override the active LLM provider')
+    .addHelpText(
+      'after',
+      `
+Examples:
+  snow ai query open P1 incidents with no assignee
+  snow ai query "change requests approved in the last 7 days" --table change_request
+  snow ai query users in the Network Support group who are active --table sys_user
+  snow ai query GRC issues where risk is high and state is not closed --table sn_grc_issue
+  snow ai query active P1 incidents with no assignee --table incident --run -f number,short_description,assigned_to
+`
+    )
+    .action(async (descriptionWords: string[], opts: { table?: string; run?: boolean; limit?: string; fields?: string; json?: boolean; provider?: string }) => {
+      const description = descriptionWords.join(' ');
+      let provider = resolveProvider();
+      if (opts.provider) {
+        const { getAIConfig } = await import('../lib/config.js');
+        const ai = getAIConfig();
+        const pc = ai.providers[opts.provider as keyof typeof ai.providers];
+        if (!pc) {
+          console.error(chalk.red(`Provider "${opts.provider}" is not configured.`));
+          process.exit(1);
+        }
+        provider = buildProvider(opts.provider, pc.model, pc.apiKey, pc.baseUrl);
+      }
+
+      let fieldContext = '';
+      if (opts.table) {
+        try {
+          const instance = getActiveInstance();
+          if (instance) {
+            const { ServiceNowClient } = await import('../lib/client.js');
+            const client = new ServiceNowClient(instance);
+            const fields = await client.queryTable('sys_dictionary', {
+              sysparmQuery: `name=${opts.table}^element!=NULL^elementISNOTEMPTY`,
+              sysparmFields: 'element,column_label,internal_type,reference',
+              sysparmLimit: 150,
+            }) as unknown as Array<{ element: string; column_label: string; internal_type: string; reference: string }>;
+            if (fields.length > 0) {
+              fieldContext = `\n\nAvailable fields on ${opts.table}:\n` +
+                fields.map((f) => `  ${f.element} (${f.internal_type}${f.reference ? ' → ' + f.reference : ''}): "${f.column_label}"`).join('\n');
+            }
+          }
+        } catch { /* non-fatal — proceed without field context */ }
+      }
+
+      const systemPrompt = `You are a ServiceNow query expert. Convert natural language descriptions into ServiceNow encoded query syntax.
+
+Rules:
+- Output ONLY the encoded query string — no explanation, no code block, no prefix
+- Use ^ for AND, ^OR for OR
+- Common operators: = != > < >= <= STARTSWITH ENDSWITH CONTAINS ISEMPTY ISNOTEMPTY IN NOTIN
+- Date macros: javascript:gs.beginningOfToday(), javascript:gs.daysAgo(7), javascript:gs.beginningOfLastWeek()
+- Reference fields: use dot-walking, e.g. assigned_to.user_name=jdoe or assigned_to.department.name=IT
+- Boolean fields: use true/false
+- State values depend on the table — use numeric values when known (e.g. incident state: 1=New, 2=In Progress, 6=Resolved, 7=Closed)
+- Empty/null checks: fieldISEMPTY or fieldISNOTEMPTY
+
+Examples:
+  "active incidents assigned to nobody" → active=true^assignment_groupISEMPTY^assigned_toISEMPTY^state!=6^state!=7
+  "change requests approved in the last week" → state=3^sys_updated_on>=javascript:gs.daysAgo(7)
+  "users in IT department" → department.name=IT^active=true`;
+
+      const userPrompt = `Convert to ServiceNow encoded query: "${description}"` +
+        (opts.table ? `\nTable: ${opts.table}` : '') +
+        fieldContext;
+
+      const spinner = ora(`Generating query with ${provider.providerName}…`).start();
+      let query: string;
+      try {
+        query = await provider.complete([
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ]);
+        spinner.stop();
+      } catch (err) {
+        spinner.fail(chalk.red('LLM request failed'));
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+      }
+
+      // Strip any accidental markdown/quotes the LLM may have added
+      query = query.trim().replace(/^```[^\n]*\n?/, '').replace(/```$/, '').replace(/^["']|["']$/g, '').trim();
+
+      console.log();
+      if (opts.table) {
+        console.log(chalk.dim(`  Table: ${opts.table}`));
+      }
+      console.log(chalk.dim(`  Query:`));
+      console.log(`  ${chalk.cyan(query)}`);
+      console.log();
+      if (opts.table && !opts.run) {
+        console.log(chalk.dim(`  Usage:`));
+        console.log(chalk.dim(`  snow table get ${opts.table} -q "${query}"`));
+        console.log();
+      }
+
+      if (opts.run) {
+        if (!opts.table) {
+          console.error(chalk.red('--run requires --table'));
+          process.exit(1);
+        }
+        const instance = getActiveInstance();
+        if (!instance) {
+          console.error(chalk.red('No active instance. Run: snow instance add'));
+          process.exit(1);
+        }
+        const { ServiceNowClient } = await import('../lib/client.js');
+        const client = new ServiceNowClient(instance);
+        const limit = parseInt(opts.limit ?? '20', 10);
+        const runSpinner = ora(`Querying ${opts.table}…`).start();
+        let rows: Record<string, unknown>[];
+        try {
+          rows = await client.queryTable(opts.table, {
+            sysparmQuery: query,
+            sysparmLimit: limit,
+            ...(opts.fields ? { sysparmFields: opts.fields } : {}),
+            sysparmDisplayValue: true,
+          }) as Record<string, unknown>[];
+          runSpinner.stop();
+        } catch (err) {
+          runSpinner.fail(chalk.red('Query failed'));
+          console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+          process.exit(1);
+        }
+
+        if (opts.json) {
+          console.log(JSON.stringify(rows, null, 2));
+          return;
+        }
+
+        if (rows.length === 0) {
+          console.log(chalk.dim('  No records found.'));
+          console.log();
+          return;
+        }
+
+        // Flatten reference fields and print a simple table
+        const flattenValue = (v: unknown): string => {
+          if (v && typeof v === 'object' && 'display_value' in (v as object)) {
+            return String((v as { display_value: unknown }).display_value ?? '');
+          }
+          return v == null ? '' : String(v);
+        };
+
+        const keys = opts.fields
+          ? opts.fields.split(',').map((s) => s.trim())
+          : Object.keys(rows[0]);
+
+        // Column widths
+        const widths = keys.map((k) => Math.max(k.length, ...rows.map((r) => flattenValue(r[k]).length)));
+        const maxWidth = 40;
+        const clampedWidths = widths.map((w) => Math.min(w, maxWidth));
+
+        const pad = (s: string, w: number) => s.length > w ? s.slice(0, w - 1) + '…' : s.padEnd(w);
+        const header = keys.map((k, i) => pad(k, clampedWidths[i])).join('  ');
+        const sep = clampedWidths.map((w) => '─'.repeat(w)).join('  ');
+
+        console.log(chalk.bold(header));
+        console.log(chalk.dim(sep));
+        for (const row of rows) {
+          console.log(keys.map((k, i) => pad(flattenValue(row[k]), clampedWidths[i])).join('  '));
+        }
+        console.log();
+        console.log(chalk.dim(`  ${rows.length} record(s)`));
+        console.log();
+      }
+    });
+
+  // snow ai translate <encoded_query>
+  cmd
+    .command('translate <encodedQuery...>')
+    .description('Translate a ServiceNow encoded query string into plain English')
+    .option('-t, --table <table>', 'Table name — adds field label context for better translation')
+    .option('--provider <name>', 'Override the active LLM provider')
+    .addHelpText(
+      'after',
+      `
+Examples:
+  snow ai translate "active=true^priority=1^assigned_toISEMPTY"
+  snow ai translate "state=1^ORstate=2^assigned_to.department.name=IT" --table incident
+  snow ai translate "approval_set>=javascript:gs.daysAgo(30)^state=approved"
+`
+    )
+    .action(async (encodedQueryWords: string[], opts: { table?: string; provider?: string }) => {
+      const encodedQuery = encodedQueryWords.join(' ');
+      let provider = resolveProvider();
+      if (opts.provider) {
+        const { getAIConfig } = await import('../lib/config.js');
+        const ai = getAIConfig();
+        const pc = ai.providers[opts.provider as keyof typeof ai.providers];
+        if (!pc) {
+          console.error(chalk.red(`Provider "${opts.provider}" is not configured.`));
+          process.exit(1);
+        }
+        provider = buildProvider(opts.provider, pc.model, pc.apiKey, pc.baseUrl);
+      }
+
+      let fieldContext = '';
+      if (opts.table) {
+        try {
+          const instance = getActiveInstance();
+          if (instance) {
+            const { ServiceNowClient } = await import('../lib/client.js');
+            const client = new ServiceNowClient(instance);
+            const fields = await client.queryTable('sys_dictionary', {
+              sysparmQuery: `name=${opts.table}^element!=NULL^elementISNOTEMPTY`,
+              sysparmFields: 'element,column_label,internal_type',
+              sysparmLimit: 150,
+            }) as unknown as Array<{ element: string; column_label: string }>;
+            if (fields.length > 0) {
+              fieldContext = `\n\nField labels for ${opts.table}:\n` +
+                fields.map((f) => `  ${f.element} = "${f.column_label}"`).join('\n');
+            }
+          }
+        } catch { /* non-fatal */ }
+      }
+
+      const systemPrompt = `You are a ServiceNow expert. Translate ServiceNow encoded query strings into clear, concise plain English.
+
+Encoded query syntax rules:
+- ^ means AND, ^OR means OR
+- Operators: = (equals), != (not equals), > < >= <= (comparisons), STARTSWITH, ENDSWITH, CONTAINS, ISEMPTY, ISNOTEMPTY, IN, NOTIN
+- Dot-walking: assigned_to.user_name means "the user_name field of the assigned_to reference"
+- javascript: prefix means a dynamic date expression (e.g. javascript:gs.daysAgo(7) = 7 days ago)
+- State fields often use numeric values that map to named states
+
+Output a clear one-to-three sentence description of what records the query would return. Be specific about conditions. If a field is ambiguous, include both the field name and your best interpretation.`;
+
+      const userPrompt = `Translate this ServiceNow encoded query to plain English:\n${encodedQuery}` +
+        (opts.table ? `\nTable: ${opts.table}` : '') +
+        fieldContext;
+
+      const spinner = ora(`Translating with ${provider.providerName}…`).start();
+      let explanation: string;
+      try {
+        explanation = await provider.complete([
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ]);
+        spinner.stop();
+      } catch (err) {
+        spinner.fail(chalk.red('LLM request failed'));
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+      }
+
+      console.log();
+      if (opts.table) console.log(chalk.dim(`  Table: ${opts.table}`));
+      console.log(chalk.dim(`  Query:   ${chalk.reset(encodedQuery)}`));
+      console.log(chalk.dim(`  Meaning:`));
+      console.log();
+      for (const line of explanation.trim().split('\n')) {
+        console.log(`  ${line}`);
+      }
+      console.log();
+    });
+
+  // snow ai fix "<error message or stack trace>"
+  cmd
+    .command('fix <error...>')
+    .description('Diagnose a ServiceNow error message or stack trace and suggest a fix')
+    .option('-t, --table <table>', 'Table or script context (e.g. sys_script_include)')
+    .option('--script <text>', 'The script body that produced the error (for deeper analysis)')
+    .option('--provider <name>', 'Override the active LLM provider')
+    .option('--save <file>', 'Save the diagnosis to a file')
+    .addHelpText(
+      'after',
+      `
+Examples:
+  snow ai fix Cannot read property getValue of null
+  snow ai fix "ReferenceError: current is not defined" --table sys_script
+  snow ai fix User does not have role admin to access /api/now/table/sys_properties
+  snow ai fix Transaction cancelled: script execution quota exceeded
+`
+    )
+    .action(async (errorWords: string[], opts: { table?: string; script?: string; provider?: string; save?: string }) => {
+      const error = errorWords.join(' ');
+      let provider = resolveProvider();
+      if (opts.provider) {
+        const { getAIConfig } = await import('../lib/config.js');
+        const ai = getAIConfig();
+        const pc = ai.providers[opts.provider as keyof typeof ai.providers];
+        if (!pc) {
+          console.error(chalk.red(`Provider "${opts.provider}" is not configured.`));
+          process.exit(1);
+        }
+        provider = buildProvider(opts.provider, pc.model, pc.apiKey, pc.baseUrl);
+      }
+
+      const systemPrompt = `You are a ServiceNow platform expert specialising in diagnosing runtime errors, script failures, and platform issues.
+
+Common ServiceNow error categories you should recognise:
+- GlideRecord errors: null references, invalid field names, missing .query() calls, getValue() on non-existent fields
+- Scope errors: cross-scope access violations, missing application node, scope not found
+- ACL/permission errors: role requirements, table access denied, field write protection
+- Script execution quota: transaction cancelled, infinite loops, excessive DB queries
+- API errors: REST API 400/401/403/404/500, invalid sys_id format, table not found
+- Business rule logic errors: setAbortAction, addErrorMessage, current vs previous
+- Client-side errors: g_form method misuse, UI policy conflicts, mandatory field validation
+- Workflow/Flow errors: context not found, activity timeouts, missing input variables
+
+For each error, provide:
+1. **Root cause** — what is actually wrong, in plain terms
+2. **Common triggers** — what typically causes this in ServiceNow
+3. **Fix** — exact code change, configuration step, or role/permission to grant
+4. **Prevention** — how to avoid it in future
+
+Be specific and practical. Include code examples where relevant. Use ES5 JavaScript syntax for any script examples (no arrow functions, no const/let, use var).`;
+
+      const userPrompt = 'ServiceNow error:\n```\n' + error + '\n```' +
+        (opts.table ? `\nContext: ${opts.table}` : '') +
+        (opts.script ? `\n\nScript that produced the error:\n\`\`\`js\n${opts.script}\n\`\`\`` : '');
+
+      const spinner = ora(`Diagnosing with ${provider.providerName}…`).start();
+      let diagnosis: string;
+      try {
+        diagnosis = await provider.complete([
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ]);
+        spinner.stop();
+      } catch (err) {
+        spinner.fail(chalk.red('LLM request failed'));
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+      }
+
+      console.log();
+      console.log(chalk.bold('Error Diagnosis'));
+      console.log(chalk.dim('─'.repeat(64)));
+      console.log(chalk.dim(`  ${error.slice(0, 100)}${error.length > 100 ? '…' : ''}`));
+      console.log(chalk.dim('─'.repeat(64)));
+      console.log();
+      for (const line of diagnosis.trim().split('\n')) {
+        console.log(line);
+      }
+      console.log();
+
+      if (opts.save) {
+        const { writeFileSync } = await import('fs');
+        const md = `# Error Diagnosis\n\n**Error:** \`${error}\`\n\n---\n\n${diagnosis.trim()}\n`;
+        writeFileSync(opts.save, md);
+        console.log(chalk.dim(`  Saved to ${opts.save}`));
+        console.log();
+      }
+    });
+
   // snow ai save-manifest <file.json>
   cmd
     .command('save-manifest <jsonFile>')

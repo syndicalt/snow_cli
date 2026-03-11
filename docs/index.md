@@ -6,7 +6,7 @@ nav_order: 1
 
 # snow-cli
 
-A portable CLI for ServiceNow. Query tables, inspect schemas, edit and search script fields, bulk-update records, manage users and groups, handle attachments, promote update sets across environments, browse the Service Catalog, inspect Flow Designer flows, manage scoped applications, tail system logs, analyse user access across every security layer, and generate complete applications using AI — all from your terminal.
+A portable CLI for ServiceNow. Query tables, inspect schemas, edit and search script fields, bulk-update records, manage users and groups, handle attachments, promote update sets across environments, browse the Service Catalog, inspect Flow Designer flows, manage scoped applications, tail and AI-analyse system logs, analyse user access across every security layer, translate queries and diagnose errors with AI, and generate complete applications — all from your terminal.
 
 ---
 
@@ -36,9 +36,13 @@ A portable CLI for ServiceNow. Query tables, inspect schemas, edit and search sc
 | [`snow flow`](browse#snow-flow) | Inspect Flow Designer flows and actions |
 | [`snow app`](browse#snow-app) | List and inspect scoped applications |
 | [`snow log`](browse#snow-log) | Tail system, app, and transaction logs |
+| [`snow log analyze`](browse#snow-log-analyze) | AI pattern analysis of recent log errors |
 | [`snow provider`](ai#snow-provider) | Configure LLM providers for AI commands |
 | [`snow ai`](ai#snow-ai) | Generate ServiceNow artifacts from natural language |
 | [`snow ai explain`](ai#snow-ai-explain) | Ask the LLM to explain any table or record in plain English |
+| [`snow ai query`](ai#snow-ai-query) | Translate natural language into an encoded query string |
+| [`snow ai translate`](ai#snow-ai-translate) | Translate an encoded query string into plain English |
+| [`snow ai fix`](ai#snow-ai-fix) | Diagnose a ServiceNow error and get a fix |
 
 ---
 

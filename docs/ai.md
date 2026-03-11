@@ -460,3 +460,88 @@ Typical use: Create incidents via the Service Desk, self-service portal,
 email ingest, or API. Drive SLA tracking, escalation rules, and reporting
 through the standard task hierarchy.
 ```
+
+---
+
+## snow ai query
+
+Translate a natural language description into a ServiceNow encoded query string. Optionally provide a table name so the LLM can reference actual field names for higher accuracy. The output can be piped directly into `snow table get`.
+
+```bash
+# Basic translation
+snow ai query "open P1 incidents with no assignee"
+
+# With table context for better field accuracy
+snow ai query "change requests approved in the last 7 days" --table change_request
+snow ai query "users in the Network Support group who are active" --table sys_user
+snow ai query "GRC issues where risk is high and state is not closed" --table sn_grc_issue
+```
+
+**Options:**
+
+| Flag | Description |
+|---|---|
+| `-t, --table <table>` | Table name — fetches field definitions to give the LLM field name context |
+| `--provider <name>` | Override the active LLM provider |
+
+**Output** prints the encoded query string ready to copy, plus a suggested `snow table get` command when `--table` is provided.
+
+**How it works:** The system prompt teaches the LLM the full encoded query syntax (operators, dot-walking, boolean fields, date macros like `javascript:gs.daysAgo(7)`). When `--table` is specified, field definitions are fetched from `sys_dictionary` and included as context so the LLM uses real field names rather than guessing.
+
+---
+
+## snow ai translate
+
+Translate a ServiceNow encoded query string into plain English. Useful for understanding queries found in URLs, business rule conditions, report filters, and data policy conditions.
+
+```bash
+snow ai translate "active=true^priority=1^assigned_toISEMPTY"
+snow ai translate "state=1^ORstate=2^assigned_to.department.name=IT" --table incident
+snow ai translate "approval_set>=javascript:gs.daysAgo(30)^state=approved"
+```
+
+**Options:**
+
+| Flag | Description |
+|---|---|
+| `-t, --table <table>` | Table name — adds field label context for more readable output |
+| `--provider <name>` | Override the active LLM provider |
+
+---
+
+## snow ai fix
+
+Diagnose a ServiceNow error message or stack trace and get a specific fix. The LLM is primed with the most common ServiceNow failure categories — GlideRecord null references, scope violations, quota exceeded errors, ACL permission blocks, and more.
+
+```bash
+# Diagnose a generic error
+snow ai fix "Cannot read property 'getValue' of null"
+
+# With script context
+snow ai fix "ReferenceError: current is not defined" --table sys_script
+
+# Permission errors
+snow ai fix "User does not have role admin to access /api/now/table/sys_properties"
+
+# Platform quota errors
+snow ai fix "Transaction cancelled: script execution quota exceeded"
+
+# Save the diagnosis
+snow ai fix "Invalid update: sys_id is read-only" --save ./fix-notes.md
+```
+
+**Options:**
+
+| Flag | Description |
+|---|---|
+| `-t, --table <table>` | Table or script type for additional context |
+| `--script <text>` | The script body that produced the error — enables deeper code-level analysis |
+| `--provider <name>` | Override the active LLM provider |
+| `--save <file>` | Write the diagnosis to a file |
+
+**Output structure:**
+
+1. **Root cause** — what is actually wrong, in plain terms
+2. **Common triggers** — what typically causes this in ServiceNow
+3. **Fix** — exact code change, configuration step, or role/permission to grant
+4. **Prevention** — how to avoid it in future

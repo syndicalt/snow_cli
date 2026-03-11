@@ -173,6 +173,18 @@ snow import ./incidents.json --table incident --dry-run
 snow security analyze nicholas.blanchard sn_grc_issue
 snow security analyze john.doe incident --operation read --no-llm
 
+# Translate natural language to an encoded query (and back)
+snow ai query "open P1 incidents with no assignee" --table incident
+snow ai translate "active=true^priority=1^assigned_toISEMPTY" --table incident
+
+# Diagnose a ServiceNow error
+snow ai fix "Cannot read property 'getValue' of null"
+snow ai fix "Transaction cancelled: script execution quota exceeded"
+
+# Analyse recent log errors with AI
+snow log analyze
+snow log analyze --scope x_myco_myapp --save ./error-report.md
+
 # Run the full factory pipeline: plan → build → test → promote
 snow factory "Build a hardware asset request app with approval workflow" --envs test,prod
 ```

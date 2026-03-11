@@ -210,3 +210,41 @@ Queries the `syslog_transaction` table. Output columns: timestamp, HTTP status, 
 | `-l, --limit <n>` | Max records (default: `25`) |
 | `--slow <ms>` | Only show transactions slower than this many milliseconds |
 | `--json` | Output as JSON |
+
+### snow log analyze
+
+Fetch recent log entries and use the active LLM provider to identify error patterns, diagnose root causes, and suggest fixes. Useful for quickly understanding what is failing on an instance without manually reading through hundreds of log lines.
+
+```bash
+# Analyse the last 50 error entries (default)
+snow log analyze
+
+# Analyse more entries
+snow log analyze --limit 100
+
+# Focus on a specific source or scope
+snow log analyze --source Evaluator
+snow log analyze --scope x_myco_myapp
+
+# Broaden to warnings as well
+snow log analyze --level warn --limit 75
+
+# Save the report to a file
+snow log analyze --save ./error-report.md
+
+# Use a specific provider
+snow log analyze --provider anthropic
+```
+
+| Flag | Description |
+|---|---|
+| `--level <level>` | Log level to fetch (default: `err`) |
+| `-l, --limit <n>` | Number of entries to send to the LLM (default: `50`) |
+| `--source <source>` | Filter by log source (e.g. `Evaluator`, `GlideRecord`) |
+| `--scope <prefix>` | Filter by application scope prefix |
+| `--provider <name>` | Override the active LLM provider |
+| `--save <file>` | Write the analysis report to a file |
+
+**Output:** The terminal shows a brief preview of the fetched entries (most recent 10), then the LLM analysis. The report groups related errors, identifies the most frequent failure patterns, provides root causes with specific error/source references, and suggests actionable fixes.
+
+Requires a configured LLM provider (`snow provider set <name>`).

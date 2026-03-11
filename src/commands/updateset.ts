@@ -779,7 +779,7 @@ Flag any scripts with anti-patterns: queries inside loops, missing null checks, 
       displaySet(set);
       console.log(chalk.dim(`\n  ${items.length} captured items across ${grouped.size} type(s)`));
 
-      const llmSpinner = ora(`Analysing with ${provider.providerName}…`).start();
+      const llmSpinner = ora(`Analyzing with ${provider.providerName}…`).start();
       let explanation: string;
       try {
         explanation = await provider.complete([

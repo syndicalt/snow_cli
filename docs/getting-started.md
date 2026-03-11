@@ -207,6 +207,10 @@ snow ai document x_myco_myapp --out ./docs/myapp.md
 # Onboard a new user — analyse comparable users and apply roles interactively
 snow ai onboard john.doe
 snow ai onboard john.doe --no-llm
+
+# Debug unexpected behavior on a specific record
+snow ai debug incident INC0012345 approval not being triggered
+snow ai debug change_request CHG0001234 state not advancing to approved --save ./debug.md
 ```
 
 ---

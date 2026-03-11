@@ -1757,7 +1757,7 @@ Provide:
 
 Be specific: name the exact artifacts most at risk.`;
 
-      const llmSpinner = ora(`Analysing with ${provider.providerName}…`).start();
+      const llmSpinner = ora(`Analyzing with ${provider.providerName}…`).start();
       let analysis: string;
       try {
         analysis = await provider.complete([
@@ -2371,6 +2371,267 @@ Examples:
       if (assigned > 0) console.log(chalk.green(`✔ Assigned ${assigned} role(s) to ${sv(targetUser['name'])}`));
       if (failed > 0) console.log(chalk.yellow(`  ${failed} role(s) could not be assigned — check permissions or role names`));
       console.log();
+    });
+
+  // ─── snow ai debug <table> <sys_id> [symptom...] ────────────────────────────
+  cmd
+    .command('debug <table> <record> [symptom...]')
+    .description('Gather every script firing on a record and ask AI to diagnose unexpected behavior')
+    .option('--provider <name>', 'Override the active LLM provider')
+    .option('--save <file>', 'Save the analysis to a markdown file')
+    .addHelpText(
+      'after',
+      `
+Examples:
+  snow ai debug incident INC0012345
+  snow ai debug incident INC0012345 approval not being triggered
+  snow ai debug change_request CHG0001234 state not advancing to approved
+  snow ai debug sys_script_include 9abc1234... script throwing null reference
+`
+    )
+    .action(async (table: string, record: string, symptomWords: string[], opts: { provider?: string; save?: string }) => {
+      const symptom = symptomWords.join(' ');
+
+      let provider = resolveProvider();
+      if (opts.provider) {
+        const { getAIConfig } = await import('../lib/config.js');
+        const ai = getAIConfig();
+        const pc = ai.providers[opts.provider as keyof typeof ai.providers];
+        if (!pc) {
+          console.error(chalk.red(`Provider "${opts.provider}" is not configured.`));
+          process.exit(1);
+        }
+        provider = buildProvider(opts.provider, pc.model, pc.apiKey, pc.baseUrl);
+      }
+
+      const instance = getActiveInstance();
+      if (!instance) {
+        console.error(chalk.red('No active instance. Run: snow instance add'));
+        process.exit(1);
+      }
+      const { ServiceNowClient } = await import('../lib/client.js');
+      const client = new ServiceNowClient(instance);
+
+      // Resolve record — number (INC0012345) or 32-char hex sys_id
+      const isSysId = /^[0-9a-f]{32}$/i.test(record);
+      const recordQuery = isSysId ? `sys_id=${record}` : `number=${record}`;
+
+      const spinner = ora(`Gathering scripts for ${table} ${record}…`).start();
+
+      type ArtRow = { name: string; [k: string]: string };
+
+      let recordRaw: Record<string, string> = {};
+      let recordDisplay: Record<string, string> = {};
+      let businessRules: ArtRow[] = [];
+      let clientScripts: ArtRow[] = [];
+      let uiPolicies: ArtRow[] = [];
+      let acls: ArtRow[] = [];
+      let dataPolicies: ArtRow[] = [];
+      let actualSysId = record;
+
+      try {
+        // Fetch the record twice — raw values for condition evaluation, display values for readability
+        const [rawRows, dispRows] = await Promise.all([
+          client.queryTable(table, { sysparmQuery: recordQuery, sysparmLimit: 1 }),
+          client.queryTable(table, { sysparmQuery: recordQuery, sysparmLimit: 1, sysparmDisplayValue: true }),
+        ]);
+
+        if (rawRows.length === 0) {
+          spinner.fail(chalk.red(`Record not found: ${table} ${record}`));
+          process.exit(1);
+        }
+
+        recordRaw = rawRows[0] as unknown as Record<string, string>;
+        recordDisplay = dispRows[0] as unknown as Record<string, string>;
+        actualSysId = String(recordRaw['sys_id'] ?? record);
+
+        // Parallel fetch all scripts that could fire on this table
+        await Promise.all([
+          client.queryTable('sys_script', {
+            sysparmQuery: `sys_class_name=sys_business_rule^collection=${table}^active=true`,
+            sysparmFields: 'name,when,order,filter_condition,script',
+            sysparmLimit: 200,
+          }).then((r) => { businessRules = r as unknown as ArtRow[]; }),
+
+          client.queryTable('sys_script_client', {
+            sysparmQuery: `table=${table}^active=true`,
+            sysparmFields: 'name,type,filter_condition,script',
+            sysparmLimit: 100,
+          }).then((r) => { clientScripts = r as unknown as ArtRow[]; }),
+
+          client.queryTable('sys_ui_policy', {
+            sysparmQuery: `table=${table}^active=true`,
+            sysparmFields: 'name,conditions,script_true,script_false',
+            sysparmLimit: 100,
+          }).then((r) => { uiPolicies = r as unknown as ArtRow[]; }),
+
+          client.queryTable('sys_security_acl', {
+            sysparmQuery: `nameSTARTSWITH${table}^active=true`,
+            sysparmFields: 'name,operation,condition,script',
+            sysparmLimit: 100,
+          }).then((r) => { acls = r as unknown as ArtRow[]; }),
+
+          client.queryTable('sys_data_policy2', {
+            sysparmQuery: `model_table=${table}^active=true`,
+            sysparmFields: 'name,conditions',
+            sysparmLimit: 50,
+          }).then((r) => { dataPolicies = r as unknown as ArtRow[]; }),
+        ]);
+
+        spinner.stop();
+      } catch (err) {
+        spinner.fail();
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+      }
+
+      // Sort BRs by canonical execution order: display → before → after → async
+      const whenOrder: Record<string, number> = { display: 0, before: 1, after: 2, async: 3 };
+      businessRules.sort((a, b) => {
+        const wa = whenOrder[a.when] ?? 9;
+        const wb = whenOrder[b.when] ?? 9;
+        if (wa !== wb) return wa - wb;
+        return (parseInt(a.order, 10) || 0) - (parseInt(b.order, 10) || 0);
+      });
+
+      const TRUNC = 1500;
+      const trunc = (s: string | undefined) => {
+        if (!s) return '(none)';
+        return s.length > TRUNC ? s.slice(0, TRUNC) + '\n… [truncated]' : s;
+      };
+
+      // Build readable field snapshot (display values, limit to non-empty fields)
+      const displayFields = Object.entries(recordDisplay)
+        .filter(([k, v]) => v && String(v).trim() && !k.startsWith('sys_'))
+        .map(([k, v]) => `  ${k}: ${String(v).slice(0, 120)}`)
+        .slice(0, 40)
+        .join('\n');
+
+      // Build prompt
+      let prompt = `# ServiceNow Record Debug: ${table} / ${record}\n\n`;
+      if (symptom) prompt += `## Reported Symptom\n${symptom}\n\n`;
+
+      prompt += `## Record Snapshot (sys_id: ${actualSysId})\n\`\`\`\n${displayFields || '(no display fields available)'}\n\`\`\`\n\n`;
+
+      if (businessRules.length > 0) {
+        prompt += `## Business Rules (execution order: display → before → after → async)\n`;
+        for (const br of businessRules) {
+          prompt += `\n### BR: ${br.name} [${br.when} / order ${br.order}]\n`;
+          if (br.filter_condition) prompt += `Filter: ${br.filter_condition}\n`;
+          prompt += `\`\`\`js\n${trunc(br.script)}\n\`\`\`\n`;
+        }
+        prompt += '\n';
+      } else {
+        prompt += `## Business Rules\n(none active on ${table})\n\n`;
+      }
+
+      if (clientScripts.length > 0) {
+        prompt += `## Client Scripts\n`;
+        for (const cs of clientScripts) {
+          prompt += `\n### CS: ${cs.name} [${cs.type}]\n`;
+          if (cs.filter_condition) prompt += `Filter: ${cs.filter_condition}\n`;
+          prompt += `\`\`\`js\n${trunc(cs.script)}\n\`\`\`\n`;
+        }
+        prompt += '\n';
+      }
+
+      if (uiPolicies.length > 0) {
+        prompt += `## UI Policies\n`;
+        for (const up of uiPolicies) {
+          prompt += `\n### UI Policy: ${up.name}\n`;
+          if (up.conditions) prompt += `Conditions: ${up.conditions}\n`;
+          if (up.script_true) prompt += `On True:\n\`\`\`js\n${trunc(up.script_true)}\n\`\`\`\n`;
+          if (up.script_false) prompt += `On False:\n\`\`\`js\n${trunc(up.script_false)}\n\`\`\`\n`;
+        }
+        prompt += '\n';
+      }
+
+      if (acls.length > 0) {
+        prompt += `## Access Control Rules\n`;
+        for (const acl of acls) {
+          prompt += `- **${acl.name}** [${acl.operation}]`;
+          if (acl.condition) prompt += ` — condition: \`${String(acl.condition).slice(0, 200)}\``;
+          if (acl.script) prompt += `\n  \`\`\`js\n  ${trunc(acl.script)}\n  \`\`\``;
+          prompt += '\n';
+        }
+        prompt += '\n';
+      }
+
+      if (dataPolicies.length > 0) {
+        prompt += `## Data Policies\n`;
+        for (const dp of dataPolicies) {
+          prompt += `- **${dp.name}**`;
+          if (dp.conditions) prompt += ` — ${dp.conditions}`;
+          prompt += '\n';
+        }
+        prompt += '\n';
+      }
+
+      const systemPrompt = `You are a ServiceNow platform expert specialising in diagnosing unexpected record behavior.
+
+You will be given a snapshot of a ServiceNow record and every active script that can fire on it: business rules (in execution order), client scripts, UI policies, ACLs, and data policies.
+
+Your job is to reason through the execution flow and identify what is causing the reported symptom (or note potential issues if no symptom is provided).
+
+Structure your analysis exactly as follows:
+
+## Execution Map
+Walk through every script in the order ServiceNow would execute it. For each, note:
+- What it does
+- Whether its filter condition would match the current record state
+- Any side effects (setAbortAction, setWorkflow, addErrorMessage, setValue, etc.)
+
+## Root Cause
+State clearly which script(s) are responsible for the reported behavior and why.
+
+## Evidence
+Quote the specific lines of code that are the smoking gun, with explanation.
+
+## Fix
+Provide the exact change needed — code patch, condition update, or configuration step. Use ES5 JavaScript for any script examples.
+
+## Additional Findings
+List any other bugs, anti-patterns, or risks you spotted while reviewing the scripts (even if unrelated to the symptom).`;
+
+      const aiSpinner = ora(`Analyzing with ${provider.providerName}…`).start();
+      let analysis: string;
+      try {
+        analysis = await provider.complete([
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: prompt },
+        ]);
+        aiSpinner.stop();
+      } catch (err) {
+        aiSpinner.fail(chalk.red('LLM request failed'));
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+      }
+
+      // Summary line
+      const brCount = businessRules.length;
+      const csCount = clientScripts.length;
+      const upCount = uiPolicies.length;
+      const aclCount = acls.length;
+      console.log();
+      console.log(chalk.bold(`Debug: ${table} / ${record}`));
+      console.log(chalk.dim('─'.repeat(64)));
+      console.log(chalk.dim(`  Business rules: ${brCount}  |  Client scripts: ${csCount}  |  UI policies: ${upCount}  |  ACLs: ${aclCount}`));
+      if (symptom) console.log(chalk.dim(`  Symptom: ${symptom}`));
+      console.log(chalk.dim('─'.repeat(64)));
+      console.log();
+      for (const line of analysis.trim().split('\n')) {
+        console.log(line);
+      }
+      console.log();
+
+      if (opts.save) {
+        const header = `# Debug: ${table} / ${record}\n\n` +
+          (symptom ? `**Symptom:** ${symptom}\n\n` : '') +
+          `**Scripts gathered:** ${brCount} business rules, ${csCount} client scripts, ${upCount} UI policies, ${aclCount} ACLs\n\n---\n\n`;
+        writeFileSync(opts.save, header + analysis.trim() + '\n');
+        console.log(chalk.dim(`  Saved to ${opts.save}`));
+        console.log();
+      }
     });
 
   // snow ai save-manifest <file.json>

@@ -749,3 +749,46 @@ snow ai document x_myco_myapp --provider anthropic
 | **Deployment Notes** | Configuration, required roles, first-time setup |
 
 Script content is truncated to 800 characters per artifact to keep the prompt within LLM context limits while preserving enough code for accurate documentation.
+
+---
+
+## snow ai debug
+
+Gather every active script that can fire on a specific record and ask the LLM to diagnose unexpected behavior. Accepts a record number (e.g. `INC0012345`) or a 32-char sys_id.
+
+```bash
+snow ai debug incident INC0012345
+snow ai debug incident INC0012345 approval not being triggered
+snow ai debug change_request CHG0001234 state not advancing to approved
+snow ai debug sys_script_include 9abc1234ef... script throwing null reference
+```
+
+| Flag | Description |
+|---|---|
+| `--provider <name>` | Override the active LLM provider |
+| `--save <file>` | Save the analysis to a markdown file |
+
+**What is fetched (all in parallel):**
+
+| Source | Query |
+|---|---|
+| Record (raw + display) | Two fetches — raw values for condition evaluation, display values for readability |
+| Business rules | `sys_script` where `sys_class_name=sys_business_rule` and `collection=<table>` |
+| Client scripts | `sys_script_client` where `table=<table>` |
+| UI policies | `sys_ui_policy` where `table=<table>` |
+| ACLs | `sys_security_acl` where `name STARTS WITH <table>` |
+| Data policies | `sys_data_policy2` where `model_table=<table>` |
+
+Business rules are sorted in ServiceNow execution order: `display` → `before` → `after` → `async`, then by order number within each phase.
+
+**Analysis sections:**
+
+| Section | Content |
+|---|---|
+| **Execution Map** | Every script walked in order, with filter match assessment and side effects |
+| **Root Cause** | Which script(s) are responsible and why |
+| **Evidence** | Quoted code lines that are the smoking gun |
+| **Fix** | Exact code patch, condition update, or configuration step |
+| **Additional Findings** | Other bugs, anti-patterns, or risks spotted during review |
+
+Script content is truncated to 1500 characters per script to balance context depth with LLM prompt size. Use `--save` to persist the full analysis as a markdown file.

@@ -412,7 +412,7 @@ Use markdown formatting. Be specific — reference the source, script names, and
       const userPrompt = `Analyse these ${logs.length} ServiceNow ${opts.level} log entries from instance "${instance.alias}"` +
         (opts.scope ? ` (scope: ${opts.scope})` : '') + ':\n\n' + logText;
 
-      const llmSpinner = ora(`Analysing with ${provider.providerName}…`).start();
+      const llmSpinner = ora(`Analyzing with ${provider.providerName}…`).start();
       let analysis: string;
       try {
         analysis = await provider.complete([

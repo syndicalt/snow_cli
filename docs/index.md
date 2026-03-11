@@ -6,7 +6,7 @@ nav_order: 1
 
 # snow-cli
 
-A portable CLI for ServiceNow. Query tables, inspect schemas, edit and search script fields, bulk-update records, manage users and groups, handle attachments, promote update sets across environments, browse the Service Catalog, inspect Flow Designer flows, manage scoped applications, tail system logs, and generate complete applications using AI — all from your terminal.
+A portable CLI for ServiceNow. Query tables, inspect schemas, edit and search script fields, bulk-update records, manage users and groups, handle attachments, promote update sets across environments, browse the Service Catalog, inspect Flow Designer flows, manage scoped applications, tail system logs, analyse user access across every security layer, and generate complete applications using AI — all from your terminal.
 
 ---
 
@@ -24,8 +24,13 @@ A portable CLI for ServiceNow. Query tables, inspect schemas, edit and search sc
 | [`snow updateset`](updatesets) | List, export, import, and diff update sets |
 | [`snow run`](admin#snow-run) | Execute a server-side script on the instance |
 | [`snow sys`](admin#snow-sys) | Read and write system properties |
+| [`snow approval`](admin#snow-approval) | List, approve, and reject approval requests |
+| [`snow watch`](admin#snow-watch) | Poll a record and print field changes in real time |
+| [`snow acl`](admin#snow-acl) | Inspect Access Control rules for a table |
+| [`snow import`](admin#snow-import) | Import records from a JSON or CSV file |
 | [`snow status`](analysis#snow-status) | Dashboard health and stats overview |
 | [`snow diff`](analysis#snow-diff) | Compare schema and scripts between instances |
+| [`snow security`](analysis#snow-security) | Analyse user access across all security layers with AI |
 | [`snow factory`](ai#snow-factory) | AI-orchestrated multi-component application pipeline |
 | [`snow catalog`](browse#snow-catalog) | Browse the Service Catalog |
 | [`snow flow`](browse#snow-flow) | Inspect Flow Designer flows and actions |

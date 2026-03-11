@@ -158,3 +158,80 @@ For each script-bearing table, shows scripts **added**, **removed**, or **change
 | `sys_script_client` | Client Scripts |
 | `sys_ui_action` | UI Actions |
 | `sysauto_script` | Scheduled Script Executions |
+
+---
+
+## snow security
+
+Analyse whether a specific user can access a ServiceNow table by gathering all active security layers — ACLs, business rules, data policies, UI policies, and client scripts — and optionally feeding the complete picture to an LLM for a structured access verdict.
+
+### snow security analyze
+
+```bash
+# Full analysis with AI verdict
+snow security analyze nicholas.blanchard sn_grc_issue
+
+# Focus on a single operation
+snow security analyze john.doe incident --operation read
+
+# Structured summary only (no LLM call)
+snow security analyze jane.smith sys_user --no-llm
+
+# Raw JSON output (all gathered data, no LLM)
+snow security analyze nicholas.blanchard change_request --json
+
+# Save the AI analysis to a Markdown file
+snow security analyze nicholas.blanchard sn_grc_issue --save report.md
+
+# Use a specific LLM provider
+snow security analyze admin sys_user --provider anthropic
+```
+
+**Options:**
+
+| Flag | Description |
+|---|---|
+| `--operation <op>` | Narrow the analysis to one operation: `read`, `write`, `create`, `delete`, `execute` |
+| `--no-llm` | Print the gathered data summary without calling the LLM |
+| `--json` | Emit all gathered security data as a raw JSON object and exit |
+| `--save <file>` | Write the AI analysis to a Markdown file |
+| `--provider <name>` | Override the active LLM provider for this command |
+
+**What it gathers:**
+
+| Layer | Table queried | What is fetched |
+|---|---|---|
+| **User identity** | `sys_user` | Name, email, active status, department, title |
+| **Direct roles** | `sys_user_has_role` | Roles assigned directly to the user |
+| **Group memberships** | `sys_user_grmember` | All groups the user belongs to |
+| **Group roles** | `sys_group_has_role` | Roles inherited through each group |
+| **ACL rules** | `sys_security_acl` + `sys_security_acl_role` | All active ACLs for the table, with required roles |
+| **Business rules** | `sys_script` | Active BRs that contain security-related logic (`setAbortAction`, `gs.hasRole`, etc.) |
+| **Data policies** | `sys_data_policy2` | Active data policies applied to the table |
+| **UI policies** | `sys_ui_policy` | Active UI policies, flagging those with scripts |
+| **Client scripts** | `sys_script_client` | Active client scripts containing field restriction logic |
+
+**Terminal output:**
+
+The summary view shows each ACL rule with a status icon for the user:
+
+| Icon | Meaning |
+|---|---|
+| `✓` (green) | User holds a required role — role-based check passes |
+| `✗` (red) | User is missing all required roles |
+| `~` (yellow) | Role check passes but rule has a condition or script — actual access may still vary |
+| `○` (yellow) | No roles required — the ACL is open to any authenticated user |
+
+**AI analysis sections:**
+
+When an LLM provider is configured, the analysis report includes:
+
+1. **Access Summary** — per-operation verdict: `ALLOWED`, `DENIED`, `CONDITIONAL`, or `UNKNOWN`
+2. **Effective Role Analysis** — which roles satisfy or fail each ACL, by operation
+3. **Blocking Components** — the specific ACL names, business rules, or policies that would prevent access
+4. **Open Risks** — ACLs with no role requirement that could grant unintended broad access
+5. **Recommendations** — practical steps to grant or restrict access
+
+**How it works:**
+
+The command resolves the full effective role set (direct roles + roles inherited through every group), then fetches all active ACLs for the table and joins their required roles. Business rules are filtered to those containing security-relevant patterns (`setAbortAction`, `gs.hasRole`, `addErrorMessage`, etc.) to avoid flooding the LLM with unrelated logic. All gathered data is assembled into a structured prompt and sent to the configured LLM provider.

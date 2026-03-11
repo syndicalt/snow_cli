@@ -146,6 +146,33 @@ snow ai build "Create a script include that auto-routes incidents by category an
 snow diff incident --against prod --fields
 snow diff all --against test --scripts --scope x_myco_myapp
 
+# Run a background script directly on the instance
+snow run "gs.print(gs.getProperty('glide.version'))"
+snow run ./fix-records.js --scope x_myco_myapp
+
+# Read and write system properties
+snow sys get glide.email.active
+snow sys set glide.email.active false
+
+# List and action approval requests
+snow approval list
+snow approval approve <sys_id> --comment "Reviewed and approved"
+
+# Watch a record for field changes in real time
+snow watch incident <sys_id> --fields state,assigned_to,priority
+
+# Inspect ACL rules for a table
+snow acl list incident --operation read
+snow acl list sn_grc_issue --role itil --fields
+
+# Import records from a CSV or JSON file
+snow import ./users.csv --table sys_user --upsert user_name
+snow import ./incidents.json --table incident --dry-run
+
+# Analyse whether a user can access a table (gathers ACLs, roles, BRs, policies)
+snow security analyze nicholas.blanchard sn_grc_issue
+snow security analyze john.doe incident --operation read --no-llm
+
 # Run the full factory pipeline: plan → build → test → promote
 snow factory "Build a hardware asset request app with approval workflow" --envs test,prod
 ```
@@ -154,7 +181,7 @@ snow factory "Build a hardware asset request app with approval workflow" --envs 
 
 ## Setting up AI providers
 
-The `snow ai` and `snow factory` commands require a configured LLM provider. See [AI & Factory](ai#snow-provider) for full details.
+The `snow ai`, `snow factory`, and `snow security analyze` commands use a configured LLM provider. See [AI & Factory](ai#snow-provider) for full details.
 
 ```bash
 # OpenAI (prompts interactively for key and model)

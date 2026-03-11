@@ -1439,6 +1439,600 @@ Be specific and practical. Include code examples where relevant. Use ES5 JavaScr
       }
     });
 
+  // ─── snow ai audit <table> <sys_id> ──────────────────────────────────────────
+  cmd
+    .command('audit <table> <sys_id>')
+    .description('AI code review of a ServiceNow script record — checks correctness, performance, ES5 compliance, and security')
+    .option('-f, --field <field>', 'Specific script field to review (default: all script fields on the record)')
+    .option('--provider <name>', 'Override the active LLM provider')
+    .option('--save <file>', 'Save the review to a markdown file')
+    .addHelpText(
+      'after',
+      `
+Examples:
+  snow ai audit sys_script_include <sys_id>
+  snow ai audit sys_business_rule <sys_id> --field script
+  snow ai audit sys_script_client <sys_id> --save ./review.md
+`
+    )
+    .action(async (table: string, sysId: string, opts: { field?: string; provider?: string; save?: string }) => {
+      let provider = resolveProvider();
+      if (opts.provider) {
+        const { getAIConfig } = await import('../lib/config.js');
+        const ai = getAIConfig();
+        const pc = ai.providers[opts.provider as keyof typeof ai.providers];
+        if (!pc) {
+          console.error(chalk.red(`Provider "${opts.provider}" is not configured.`));
+          process.exit(1);
+        }
+        provider = buildProvider(opts.provider, pc.model, pc.apiKey, pc.baseUrl);
+      }
+
+      const instance = getActiveInstance();
+      if (!instance) {
+        console.error(chalk.red('No active instance. Run: snow instance add'));
+        process.exit(1);
+      }
+      const { ServiceNowClient } = await import('../lib/client.js');
+      const client = new ServiceNowClient(instance);
+
+      const spinner = ora(`Fetching ${table}/${sysId}…`).start();
+      let record: Record<string, unknown>;
+      let dictFields: Array<{ element: string; column_label: string; internal_type: string }>;
+      try {
+        [record, dictFields] = await Promise.all([
+          client.getRecord(table, sysId) as Promise<Record<string, unknown>>,
+          client.queryTable('sys_dictionary', {
+            sysparmQuery: `name=${table}^internal_typeINscript,script_plain,conditions,condition^elementISNOTEMPTY`,
+            sysparmFields: 'element,column_label,internal_type',
+            sysparmLimit: 20,
+          }) as unknown as Promise<Array<{ element: string; column_label: string; internal_type: string }>>,
+        ]);
+        spinner.stop();
+      } catch (err) {
+        spinner.fail();
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+      }
+
+      // Determine fields to review
+      let fieldsToReview: Array<{ element: string; label: string }>;
+      if (opts.field) {
+        fieldsToReview = [{ element: opts.field, label: opts.field }];
+      } else if (dictFields.length > 0) {
+        fieldsToReview = dictFields.map((f) => ({ element: f.element, label: f.column_label || f.element }));
+      } else {
+        // Fallback: common script field names
+        const common = ['script', 'condition', 'filter_condition', 'html', 'message'];
+        fieldsToReview = common
+          .filter((f) => record[f] && String(record[f]).trim().length > 10)
+          .map((f) => ({ element: f, label: f }));
+      }
+
+      if (fieldsToReview.length === 0) {
+        console.log(chalk.yellow('No script fields found on this record.'));
+        return;
+      }
+
+      let reviewContent = '';
+      for (const f of fieldsToReview) {
+        const value = String(record[f.element] ?? '').trim();
+        if (!value || value.length < 5) continue;
+        reviewContent += `\n### Field: ${f.label} (${f.element})\n\`\`\`js\n${value}\n\`\`\`\n`;
+      }
+
+      if (!reviewContent) {
+        console.log(chalk.yellow('No script content found in the identified fields.'));
+        return;
+      }
+
+      const tableContextMap: Record<string, string> = {
+        sys_script_include: 'Script Include — server-side reusable library',
+        sys_business_rule: `Business Rule on "${record['collection'] ?? ''}" — ${record['when'] ?? 'unknown'} trigger`,
+        sys_script_client: `Client Script on "${record['table'] ?? ''}" — type: ${record['type'] ?? 'unknown'}`,
+        sys_ui_action: `UI Action on "${record['table'] ?? ''}"`,
+        sys_scheduled_script_type: 'Scheduled Script',
+        sys_transform_script: 'Transform Map Script',
+      };
+      const ctx = tableContextMap[table] ?? `Script record on table: ${table}`;
+      const recordName = String(record['name'] ?? sysId);
+
+      const systemPrompt = `You are a senior ServiceNow developer performing a thorough code review.
+
+Review the provided script(s) for:
+1. **Correctness** — logical errors, missing null checks, incorrect GlideRecord usage, missing .query() calls
+2. **Performance** — queries inside loops, no row limits on GlideRecord, excessive synchronous calls
+3. **Security** — hardcoded credentials, privilege escalation, injection risks
+4. **ES5 Compliance** — ServiceNow server scripts must be ES5: no arrow functions, no const/let (use var), no template literals, no destructuring, no class syntax (use Class.create())
+5. **Best Practices** — proper use of GlideRecord, error handling, scope awareness
+6. **Style & Maintainability** — naming conventions, clarity, comments on complex logic
+
+Format your response as:
+
+## Summary
+<1-2 sentence overall assessment>
+
+## Issues Found
+For each issue:
+### [Critical|High|Medium|Low|Info] — <short title>
+- **Location:** <field or line>
+- **Issue:** <what is wrong>
+- **Fix:** <exact correction or recommendation>
+
+## Positive Observations
+<what the code does well>
+
+## Overall Rating
+<Needs Work | Acceptable | Good | Excellent>`;
+
+      const reviewSpinner = ora(`Reviewing with ${provider.providerName}…`).start();
+      let review: string;
+      try {
+        review = await provider.complete([
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: `Review this ServiceNow ${ctx}:\n\n**Record:** ${recordName}\n**Table:** ${table}\n${reviewContent}` },
+        ]);
+        reviewSpinner.stop();
+      } catch (err) {
+        reviewSpinner.fail(chalk.red('LLM request failed'));
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+      }
+
+      console.log();
+      console.log(chalk.bold(`Code Review: ${recordName}`));
+      console.log(chalk.dim(`  Table: ${table}  |  sys_id: ${sysId}`));
+      console.log(chalk.dim('─'.repeat(64)));
+      console.log();
+      for (const line of review.trim().split('\n')) {
+        console.log(line);
+      }
+      console.log();
+
+      if (opts.save) {
+        const md = `# Code Review: ${recordName}\n\n**Table:** ${table}  \n**sys_id:** ${sysId}  \n\n---\n\n${review.trim()}\n`;
+        writeFileSync(opts.save, md);
+        console.log(chalk.dim(`  Saved to ${opts.save}`));
+        console.log();
+      }
+    });
+
+  // ─── snow ai impact <table> [--field <field>] ─────────────────────────────
+  cmd
+    .command('impact <table>')
+    .description('Assess the blast radius of modifying a table or field — gathers all references and uses AI to predict what will break')
+    .option('-f, --field <field>', 'Focus on a specific field within the table')
+    .option('--provider <name>', 'Override the active LLM provider')
+    .option('--save <file>', 'Save the analysis to a markdown file')
+    .addHelpText(
+      'after',
+      `
+Examples:
+  snow ai impact incident
+  snow ai impact incident --field category
+  snow ai impact x_myco_myapp_orders --field status --save ./impact.md
+`
+    )
+    .action(async (table: string, opts: { field?: string; provider?: string; save?: string }) => {
+      let provider = resolveProvider();
+      if (opts.provider) {
+        const { getAIConfig } = await import('../lib/config.js');
+        const ai = getAIConfig();
+        const pc = ai.providers[opts.provider as keyof typeof ai.providers];
+        if (!pc) {
+          console.error(chalk.red(`Provider "${opts.provider}" is not configured.`));
+          process.exit(1);
+        }
+        provider = buildProvider(opts.provider, pc.model, pc.apiKey, pc.baseUrl);
+      }
+
+      const instance = getActiveInstance();
+      if (!instance) {
+        console.error(chalk.red('No active instance. Run: snow instance add'));
+        process.exit(1);
+      }
+      const { ServiceNowClient } = await import('../lib/client.js');
+      const client = new ServiceNowClient(instance);
+
+      const spinner = ora(`Gathering references to ${table}${opts.field ? `.${opts.field}` : ''}…`).start();
+
+      type ArtRow = { name: string; [k: string]: string };
+      let businessRules: ArtRow[] = [];
+      let clientScripts: ArtRow[] = [];
+      let uiPolicies: ArtRow[] = [];
+      let uiActions: ArtRow[] = [];
+      let dataPolicies: ArtRow[] = [];
+      let transformMaps: ArtRow[] = [];
+      let referencingFields: ArtRow[] = [];
+      let fieldInfo: ArtRow[] = [];
+
+      try {
+        const fetches: Promise<void>[] = [
+          client.queryTable('sys_script', {
+            sysparmQuery: `sys_class_name=sys_business_rule^collection=${table}^active=true`,
+            sysparmFields: 'name,when,order,filter_condition',
+            sysparmLimit: 100,
+          }).then((r) => { businessRules = r as unknown as ArtRow[]; }),
+
+          client.queryTable('sys_script_client', {
+            sysparmQuery: `table=${table}^active=true`,
+            sysparmFields: 'name,type,filter_condition',
+            sysparmLimit: 100,
+          }).then((r) => { clientScripts = r as unknown as ArtRow[]; }),
+
+          client.queryTable('sys_ui_policy', {
+            sysparmQuery: `table=${table}^active=true`,
+            sysparmFields: 'name,conditions',
+            sysparmLimit: 100,
+          }).then((r) => { uiPolicies = r as unknown as ArtRow[]; }),
+
+          client.queryTable('sys_ui_action', {
+            sysparmQuery: `table=${table}^active=true`,
+            sysparmFields: 'name,action_name',
+            sysparmLimit: 100,
+          }).then((r) => { uiActions = r as unknown as ArtRow[]; }),
+
+          client.queryTable('sys_data_policy2', {
+            sysparmQuery: `model_table=${table}^active=true`,
+            sysparmFields: 'name',
+            sysparmLimit: 50,
+          }).then((r) => { dataPolicies = r as unknown as ArtRow[]; }),
+
+          client.queryTable('sys_transform_map', {
+            sysparmQuery: `source_table=${table}^ORtarget_table=${table}`,
+            sysparmFields: 'name,source_table,target_table',
+            sysparmLimit: 50,
+          }).then((r) => { transformMaps = r as unknown as ArtRow[]; }),
+
+          client.queryTable('sys_dictionary', {
+            sysparmQuery: `reference=${table}^internal_type=reference^nameNOT INsys_audit,sys_journal,sys_journal_field`,
+            sysparmFields: 'name,element,column_label',
+            sysparmLimit: 100,
+          }).then((r) => { referencingFields = r as unknown as ArtRow[]; }),
+        ];
+
+        if (opts.field) {
+          fetches.push(
+            client.queryTable('sys_dictionary', {
+              sysparmQuery: `name=${table}^element=${opts.field}`,
+              sysparmFields: 'element,column_label,internal_type,mandatory,read_only,default_value',
+              sysparmLimit: 1,
+            }).then((r) => { fieldInfo = r as unknown as ArtRow[]; })
+          );
+        }
+
+        await Promise.all(fetches);
+        spinner.stop();
+      } catch (err) {
+        spinner.fail();
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+      }
+
+      // Build prompt
+      const target = opts.field ? `field \`${opts.field}\` on table \`${table}\`` : `table \`${table}\``;
+      let promptBody = `# Impact Analysis: ${target}\n\n`;
+
+      if (opts.field && fieldInfo.length > 0) {
+        const fi = fieldInfo[0];
+        promptBody += `## Field Definition\n- Label: ${fi.column_label}\n- Type: ${fi.internal_type}\n- Mandatory: ${fi.mandatory}\n- Read-only: ${fi.read_only}\n`;
+        if (fi.default_value) promptBody += `- Default: ${fi.default_value}\n`;
+        promptBody += '\n';
+      }
+
+      const section = (title: string, items: ArtRow[], extraFields: string[]) => {
+        if (items.length === 0) return `## ${title}\nNone found.\n\n`;
+        let s = `## ${title} (${items.length})\n`;
+        for (const item of items) {
+          s += `- **${item.name}**`;
+          const extras = extraFields
+            .filter((f) => f !== 'name' && item[f])
+            .map((f) => `${f}: ${String(item[f]).slice(0, 80)}`);
+          if (extras.length) s += ` — ${extras.join(', ')}`;
+          s += '\n';
+        }
+        return s + '\n';
+      };
+
+      promptBody += section('Business Rules', businessRules, ['when', 'order', 'filter_condition']);
+      promptBody += section('Client Scripts', clientScripts, ['type', 'filter_condition']);
+      promptBody += section('UI Policies', uiPolicies, ['conditions']);
+      promptBody += section('UI Actions', uiActions, ['action_name']);
+      promptBody += section('Data Policies', dataPolicies, []);
+      promptBody += section('Transform Maps', transformMaps, ['source_table', 'target_table']);
+      promptBody += section('Tables With References To This Table', referencingFields, ['name', 'element', 'column_label']);
+
+      const systemPrompt = `You are a senior ServiceNow architect specialising in change impact analysis.
+
+Given all artifacts referencing a table or field, assess what happens if it is modified or removed.
+
+Provide:
+1. **Summary** — how widely used is this? (2-3 sentences)
+2. **Immediate Break Risk** — what will fail the moment the change is deployed?
+3. **Functional Impact** — which business processes are affected and how?
+4. **Data Impact** — data migration needs, integrity constraints, or existing records affected?
+5. **Testing Checklist** — specific scenarios to test after the change (bullet list)
+6. **Recommended Approach** — how to safely make this change (phased rollout, deprecation, migration scripts, etc.)
+7. **Risk Rating** — Low / Medium / High / Critical
+
+Be specific: name the exact artifacts most at risk.`;
+
+      const llmSpinner = ora(`Analysing with ${provider.providerName}…`).start();
+      let analysis: string;
+      try {
+        analysis = await provider.complete([
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: `Analyse the impact of changing ${target}:\n\n${promptBody}` },
+        ]);
+        llmSpinner.stop();
+      } catch (err) {
+        llmSpinner.fail(chalk.red('LLM request failed'));
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+      }
+
+      const header = opts.field ? `${table}.${opts.field}` : table;
+      const counts = [
+        `${businessRules.length} BRs`,
+        `${clientScripts.length} client scripts`,
+        `${uiPolicies.length} UI policies`,
+        `${uiActions.length} UI actions`,
+        `${dataPolicies.length} data policies`,
+        `${transformMaps.length} transform maps`,
+        `${referencingFields.length} referencing tables`,
+      ].join('  ');
+
+      console.log();
+      console.log(chalk.bold(`Impact Analysis: ${header}`));
+      console.log(chalk.dim(`  ${counts}`));
+      console.log(chalk.dim('─'.repeat(64)));
+      console.log();
+      for (const line of analysis.trim().split('\n')) {
+        console.log(line);
+      }
+      console.log();
+
+      if (opts.save) {
+        const md = `# Impact Analysis: ${header}\n\n${counts}\n\n---\n\n${analysis.trim()}\n`;
+        writeFileSync(opts.save, md);
+        console.log(chalk.dim(`  Saved to ${opts.save}`));
+        console.log();
+      }
+    });
+
+  // ─── snow ai document <scope> ────────────────────────────────────────────
+  cmd
+    .command('document <scope>')
+    .description('Generate comprehensive markdown documentation for a scoped application')
+    .option('--provider <name>', 'Override the active LLM provider')
+    .option('-o, --out <file>', 'Output file (default: <scope>-docs.md)')
+    .addHelpText(
+      'after',
+      `
+Examples:
+  snow ai document x_myco_myapp
+  snow ai document x_myco_myapp --out ./docs/myapp.md
+`
+    )
+    .action(async (scope: string, opts: { provider?: string; out?: string }) => {
+      let provider = resolveProvider();
+      if (opts.provider) {
+        const { getAIConfig } = await import('../lib/config.js');
+        const ai = getAIConfig();
+        const pc = ai.providers[opts.provider as keyof typeof ai.providers];
+        if (!pc) {
+          console.error(chalk.red(`Provider "${opts.provider}" is not configured.`));
+          process.exit(1);
+        }
+        provider = buildProvider(opts.provider, pc.model, pc.apiKey, pc.baseUrl);
+      }
+
+      const instance = getActiveInstance();
+      if (!instance) {
+        console.error(chalk.red('No active instance. Run: snow instance add'));
+        process.exit(1);
+      }
+      const { ServiceNowClient } = await import('../lib/client.js');
+      const client = new ServiceNowClient(instance);
+
+      const spinner = ora(`Fetching artifacts for scope ${chalk.cyan(scope)}…`).start();
+
+      type AppRecord = { name: string; scope: string; version: string; short_description: string };
+      type SIRecord = { name: string; api_name: string; script: string; description: string };
+      type BRRecord = { name: string; collection: string; when: string; order: string; filter_condition: string; script: string };
+      type CSRecord = { name: string; table: string; type: string; script: string };
+      type UARecord = { name: string; table: string; action_name: string; script: string };
+      type SJRecord = { name: string; script: string; run_period: string };
+
+      const q = `sys_scope.scope=${scope}^active=true`;
+      let appInfo: AppRecord[] = [];
+      let scriptIncludes: SIRecord[] = [];
+      let businessRules: BRRecord[] = [];
+      let clientScripts: CSRecord[] = [];
+      let uiActions: UARecord[] = [];
+      let scheduledJobs: SJRecord[] = [];
+
+      try {
+        await Promise.all([
+          client.queryTable('sys_app', {
+            sysparmQuery: `scope=${scope}`,
+            sysparmFields: 'name,scope,version,short_description',
+            sysparmLimit: 1,
+          }).then((r) => { appInfo = r as unknown as AppRecord[]; }),
+
+          client.queryTable('sys_script_include', {
+            sysparmQuery: q,
+            sysparmFields: 'name,api_name,script,description',
+            sysparmLimit: 100,
+          }).then((r) => { scriptIncludes = r as unknown as SIRecord[]; }),
+
+          client.queryTable('sys_script', {
+            sysparmQuery: `${q}^sys_class_name=sys_business_rule`,
+            sysparmFields: 'name,collection,when,order,filter_condition,script',
+            sysparmLimit: 100,
+          }).then((r) => { businessRules = r as unknown as BRRecord[]; }),
+
+          client.queryTable('sys_script_client', {
+            sysparmQuery: q,
+            sysparmFields: 'name,table,type,script',
+            sysparmLimit: 100,
+          }).then((r) => { clientScripts = r as unknown as CSRecord[]; }),
+
+          client.queryTable('sys_ui_action', {
+            sysparmQuery: q,
+            sysparmFields: 'name,table,action_name,script',
+            sysparmLimit: 100,
+          }).then((r) => { uiActions = r as unknown as UARecord[]; }),
+
+          client.queryTable('sys_scheduled_script_type', {
+            sysparmQuery: q,
+            sysparmFields: 'name,script,run_period',
+            sysparmLimit: 50,
+          }).then((r) => { scheduledJobs = r as unknown as SJRecord[]; }),
+        ]);
+        spinner.stop();
+      } catch (err) {
+        spinner.fail();
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+      }
+
+      const totalArtifacts = scriptIncludes.length + businessRules.length +
+        clientScripts.length + uiActions.length + scheduledJobs.length;
+
+      if (totalArtifacts === 0) {
+        console.log(chalk.yellow(`No artifacts found for scope: ${scope}`));
+        console.log(chalk.dim('  Verify the scope prefix is correct (e.g. x_myco_myapp).'));
+        return;
+      }
+
+      const TRUNC = 800;
+      const trunc = (s: string) => s.length > TRUNC ? s.slice(0, TRUNC) + '\n// [... truncated]' : s;
+
+      const app = appInfo[0];
+      let promptBody = `# Application: ${app?.name || scope}\n`;
+      promptBody += `**Scope:** ${scope}\n`;
+      if (app?.version) promptBody += `**Version:** ${app.version}\n`;
+      if (app?.short_description) promptBody += `**Description:** ${app.short_description}\n`;
+      promptBody += `**Artifacts:** ${scriptIncludes.length} script includes, ${businessRules.length} business rules, ${clientScripts.length} client scripts, ${uiActions.length} UI actions, ${scheduledJobs.length} scheduled jobs\n\n`;
+
+      if (scriptIncludes.length > 0) {
+        promptBody += `## Script Includes\n`;
+        for (const si of scriptIncludes) {
+          promptBody += `\n### ${si.name}\n`;
+          if (si.description) promptBody += `${si.description}\n`;
+          promptBody += `**API Name:** ${si.api_name}\n\`\`\`js\n${trunc(si.script)}\n\`\`\`\n`;
+        }
+        promptBody += '\n';
+      }
+
+      if (businessRules.length > 0) {
+        promptBody += `## Business Rules\n`;
+        for (const br of businessRules) {
+          promptBody += `\n### ${br.name}\n`;
+          promptBody += `**Table:** ${br.collection} | **Trigger:** ${br.when} (order: ${br.order})\n`;
+          if (br.filter_condition) promptBody += `**Condition:** ${br.filter_condition}\n`;
+          promptBody += `\`\`\`js\n${trunc(br.script)}\n\`\`\`\n`;
+        }
+        promptBody += '\n';
+      }
+
+      if (clientScripts.length > 0) {
+        promptBody += `## Client Scripts\n`;
+        for (const cs of clientScripts) {
+          promptBody += `\n### ${cs.name}\n`;
+          promptBody += `**Table:** ${cs.table} | **Type:** ${cs.type}\n`;
+          promptBody += `\`\`\`js\n${trunc(cs.script)}\n\`\`\`\n`;
+        }
+        promptBody += '\n';
+      }
+
+      if (uiActions.length > 0) {
+        promptBody += `## UI Actions\n`;
+        for (const ua of uiActions) {
+          promptBody += `\n### ${ua.name}\n`;
+          promptBody += `**Table:** ${ua.table} | **Action:** ${ua.action_name}\n`;
+          if (ua.script) promptBody += `\`\`\`js\n${trunc(ua.script)}\n\`\`\`\n`;
+        }
+        promptBody += '\n';
+      }
+
+      if (scheduledJobs.length > 0) {
+        promptBody += `## Scheduled Jobs\n`;
+        for (const sj of scheduledJobs) {
+          promptBody += `\n### ${sj.name}\n`;
+          if (sj.run_period) promptBody += `**Schedule:** ${sj.run_period}\n`;
+          promptBody += `\`\`\`js\n${trunc(sj.script)}\n\`\`\`\n`;
+        }
+        promptBody += '\n';
+      }
+
+      const systemPrompt = `You are a technical writer specialising in ServiceNow application documentation.
+
+Generate comprehensive, developer-friendly markdown documentation for the provided ServiceNow scoped application. The output should be ready to use as a GitHub README or internal wiki page.
+
+Structure your output as:
+
+# <App Name>
+
+## Overview
+What the app does, its purpose, who uses it.
+
+## Architecture
+How the components fit together and key design decisions.
+
+## Script Includes
+For each: purpose, key methods with signatures, usage example.
+
+## Business Rules
+For each: trigger (table, when, condition), purpose, side effects.
+
+## Client Scripts
+For each: trigger (onLoad/onChange/onSubmit, table), what it does.
+
+## UI Actions
+Brief description of each button or context menu item.
+
+## Scheduled Jobs
+Frequency and purpose of each job.
+
+## Dependencies
+OOTB tables, other scoped apps, or external integrations.
+
+## Deployment Notes
+Configuration steps, required roles, or first-time setup.
+
+Write clearly and accurately based on the actual code. Do not invent functionality.`;
+
+      const llmSpinner = ora(`Generating docs with ${provider.providerName}…`).start();
+      let docs: string;
+      try {
+        docs = await provider.complete([
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: `Generate documentation for this ServiceNow application:\n\n${promptBody}` },
+        ]);
+        llmSpinner.stop();
+      } catch (err) {
+        llmSpinner.fail(chalk.red('LLM request failed'));
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+      }
+
+      const outFile = opts.out ?? `${scope}-docs.md`;
+      writeFileSync(outFile, docs.trim() + '\n');
+
+      console.log();
+      console.log(chalk.green(`Documentation saved to: ${outFile}`));
+      console.log(chalk.dim(`  ${totalArtifacts} artifacts documented`));
+      console.log();
+      // Print preview
+      const previewLines = docs.trim().split('\n').slice(0, 8);
+      console.log(chalk.dim('─'.repeat(60)));
+      for (const line of previewLines) console.log(chalk.dim(line));
+      console.log(chalk.dim('─'.repeat(60)));
+      console.log();
+    });
+
   // snow ai save-manifest <file.json>
   cmd
     .command('save-manifest <jsonFile>')

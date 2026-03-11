@@ -29,6 +29,7 @@ Manage ServiceNow update sets from the CLI — list, inspect, export, import, an
 | `snow updateset export <name>` | Download the update set as an XML file |
 | `snow updateset apply <xml-file>` | Upload an XML file to another instance |
 | `snow updateset diff <set1> <set2>` | Compare captured items between two update sets |
+| `snow updateset explain <name>` | AI-generated pre-promotion review of an update set |
 
 Names or sys_ids are accepted wherever `<name>` appears.
 
@@ -152,3 +153,36 @@ Output shows:
 - Items only in the second set (added in second) — in green
 - Items in both sets, flagged if the action changed — in yellow
 - A summary line: `3 removed  5 added  1 changed  42 unchanged`
+
+---
+
+### explain
+
+AI-generated pre-promotion review of an update set. Fetches all captured items and their payloads, extracts script content, and asks the LLM to summarise what the update set does, what is affected, and what to test before committing.
+
+```bash
+snow updateset explain "Sprint 42"
+snow updateset explain <sys_id>
+snow updateset explain "My Feature Branch" --save ./pre-flight.md
+
+# Use a specific LLM provider
+snow updateset explain "Sprint 42" --provider anthropic
+```
+
+| Flag | Description |
+|---|---|
+| `--provider <name>` | Override the active LLM provider |
+| `--save <file>` | Write the report to a markdown file |
+
+**What the AI report covers:**
+
+| Section | Description |
+|---|---|
+| **Summary** | What the update set does in plain English (2-4 sentences) |
+| **Affected Areas** | Which tables, workflows, and business processes are touched |
+| **Risk Assessment** | What could go wrong when promoting — rated Low / Medium / High |
+| **Testing Checklist** | Specific scenarios to test before committing |
+| **Dependencies** | Required roles, records, or other update sets this relies on |
+| **Concerns** | Unusual patterns, anti-patterns in scripts, or things needing a second look |
+
+Script content from business rules, script includes, client scripts, UI actions, scheduled jobs, and ACLs is extracted from the `sys_update_xml` payload and sent to the LLM. Scripts are truncated to 600 characters each to keep the prompt manageable.

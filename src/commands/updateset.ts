@@ -623,5 +623,195 @@ export function updatesetCommand(): Command {
       console.log(`  ${summary}`);
     });
 
+  // -------------------------------------------------------------------------
+  // snow updateset explain <name-or-sys_id>
+  // -------------------------------------------------------------------------
+  cmd
+    .command('explain <name>')
+    .description('Use AI to summarise what an update set changes, what is affected, and what to test before promoting')
+    .option('--provider <name>', 'Override the active LLM provider')
+    .option('--save <file>', 'Save the explanation to a markdown file')
+    .addHelpText(
+      'after',
+      `
+Examples:
+  snow updateset explain "Sprint 42"
+  snow updateset explain <sys_id>
+  snow updateset explain "My Feature" --save ./pre-flight.md
+`
+    )
+    .action(async (nameOrId: string, opts: { provider?: string; save?: string }) => {
+      // Dynamic imports so we only load LLM deps when needed
+      const { getActiveProvider, getAIConfig } = await import('../lib/config.js');
+      const { buildProvider } = await import('../lib/llm.js');
+
+      let active = getActiveProvider();
+      if (opts.provider) {
+        const ai = getAIConfig();
+        const pc = ai.providers[opts.provider as keyof typeof ai.providers];
+        if (!pc) {
+          console.error(chalk.red(`Provider "${opts.provider}" is not configured.`));
+          process.exit(1);
+        }
+        active = { name: opts.provider, config: pc };
+      }
+      if (!active) {
+        console.error(chalk.red('No LLM provider configured. Run `snow provider set <name>` first.'));
+        process.exit(1);
+      }
+      const provider = buildProvider(active.name, active.config.model, active.config.apiKey, active.config.baseUrl);
+
+      const instance = requireActiveInstance();
+      const client = new ServiceNowClient(instance);
+
+      // Resolve update set
+      const resolveSpinner = ora('Resolving update set…').start();
+      let set: UpdateSet;
+      try {
+        set = await resolveUpdateSet(client, nameOrId);
+        resolveSpinner.stop();
+      } catch (err) {
+        resolveSpinner.fail();
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+      }
+
+      // Fetch captured items with payload
+      const itemSpinner = ora('Fetching captured items…').start();
+      type UpdateXmlWithPayload = UpdateXml & { payload: string };
+      let items: UpdateXmlWithPayload[];
+      try {
+        items = await client.queryTable('sys_update_xml', {
+          sysparmQuery: `update_set=${set.sys_id}^ORDERBYtype`,
+          sysparmFields: 'sys_id,name,type,target_name,action,payload',
+          sysparmLimit: 200,
+        }) as unknown as UpdateXmlWithPayload[];
+        itemSpinner.stop();
+      } catch (err) {
+        itemSpinner.fail();
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+      }
+
+      if (items.length === 0) {
+        console.log(chalk.yellow('This update set has no captured items.'));
+        return;
+      }
+
+      // Helper: extract a field value from XML payload
+      function extractField(payload: string, field: string): string {
+        const cdataRe = new RegExp(`<${field}[^>]*><!\\[CDATA\\[([\\s\\S]*?)\\]\\]></${field}>`, 'i');
+        const m = payload.match(cdataRe);
+        if (m) return m[1].trim();
+        const plainRe = new RegExp(`<${field}[^>]*>([^<]*)</${field}>`, 'i');
+        const p = payload.match(plainRe);
+        if (p) return p[1].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').trim();
+        return '';
+      }
+
+      const FIELDS_BY_TYPE: Record<string, string[]> = {
+        sys_script_include: ['api_name', 'active', 'script'],
+        sys_business_rule: ['collection', 'when', 'order', 'filter_condition', 'condition', 'active', 'script'],
+        sys_script_client: ['table', 'type', 'filter_condition', 'active', 'script'],
+        sys_ui_action: ['table', 'action_name', 'active', 'script'],
+        sys_ui_policy: ['table', 'conditions', 'active'],
+        sys_scheduled_script_type: ['run_period', 'active', 'script'],
+        sys_transform_script: ['active', 'script'],
+        sys_transform_map: ['source_table', 'target_table', 'active'],
+        sys_security_acl: ['operation', 'type', 'active', 'condition', 'script'],
+      };
+      const MAX_SCRIPT = 600;
+
+      // Group items by type and extract relevant content
+      type ParsedItem = { targetName: string; action: string; meta: Record<string, string>; script: string };
+      const grouped = new Map<string, ParsedItem[]>();
+      for (const item of items) {
+        const fields = FIELDS_BY_TYPE[item.type] ?? [];
+        const meta: Record<string, string> = {};
+        let script = '';
+        for (const f of fields) {
+          const v = extractField(item.payload || '', f);
+          if (!v) continue;
+          if (f === 'script') {
+            script = v.length > MAX_SCRIPT ? v.slice(0, MAX_SCRIPT) + '\n// [... truncated]' : v;
+          } else {
+            meta[f] = v;
+          }
+        }
+        if (!grouped.has(item.type)) grouped.set(item.type, []);
+        grouped.get(item.type)!.push({ targetName: item.target_name, action: item.action, meta, script });
+      }
+
+      // Build structured prompt
+      const appLabel = typeof set.application === 'object' ? set.application.display_value : set.application;
+      let promptBody = `## Update Set: ${set.name}\n`;
+      promptBody += `**State:** ${set.state}\n`;
+      promptBody += `**Application:** ${appLabel || 'Global'}\n`;
+      promptBody += `**Created by:** ${set.sys_created_by}\n`;
+      if (set.description) promptBody += `**Description:** ${set.description}\n`;
+      promptBody += `**Total items:** ${items.length}\n\n`;
+
+      for (const [type, typeItems] of grouped) {
+        promptBody += `### ${type} (${typeItems.length})\n`;
+        for (const item of typeItems) {
+          promptBody += `\n**${item.targetName}** [${item.action}]\n`;
+          for (const [k, v] of Object.entries(item.meta)) {
+            promptBody += `- ${k}: ${v}\n`;
+          }
+          if (item.script) promptBody += `\`\`\`js\n${item.script}\n\`\`\`\n`;
+        }
+        promptBody += '\n';
+      }
+
+      const systemPrompt = `You are a senior ServiceNow developer performing a pre-promotion update set review.
+
+Analyse the provided update set and produce a structured report:
+
+1. **Summary** — what does this update set do in plain English? (2-4 sentences)
+2. **Affected Areas** — which tables, workflows, and business processes are touched?
+3. **Risk Assessment** — what could go wrong when promoting to production? Rate overall risk: Low / Medium / High
+4. **Testing Checklist** — specific scenarios to test before committing (bullet list)
+5. **Dependencies** — prerequisite records, roles, or other update sets this depends on
+6. **Concerns** — anything unusual, potentially breaking, or that needs a second look
+
+Flag any scripts with anti-patterns: queries inside loops, missing null checks, hardcoded values, non-ES5 syntax.`;
+
+      displaySet(set);
+      console.log(chalk.dim(`\n  ${items.length} captured items across ${grouped.size} type(s)`));
+
+      const llmSpinner = ora(`Analysing with ${provider.providerName}…`).start();
+      let explanation: string;
+      try {
+        explanation = await provider.complete([
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: `Please review this update set:\n\n${promptBody}` },
+        ]);
+        llmSpinner.stop();
+      } catch (err) {
+        llmSpinner.fail(chalk.red('LLM request failed'));
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+      }
+
+      console.log();
+      console.log(chalk.bold('AI Update Set Analysis'));
+      console.log(chalk.dim('─'.repeat(64)));
+      console.log();
+      for (const line of explanation.trim().split('\n')) {
+        console.log(line);
+      }
+      console.log();
+
+      if (opts.save) {
+        const md = `# Update Set Analysis: ${set.name}\n\n` +
+          `**State:** ${set.state}  \n**Application:** ${appLabel || 'Global'}  \n` +
+          `**Created by:** ${set.sys_created_by}  \n**Items:** ${items.length}  \n\n---\n\n` +
+          explanation.trim() + '\n';
+        writeFileSync(opts.save, md, 'utf-8');
+        console.log(chalk.dim(`  Saved to ${opts.save}`));
+        console.log();
+      }
+    });
+
   return cmd;
 }

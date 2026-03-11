@@ -187,6 +187,22 @@ snow log analyze --scope x_myco_myapp --save ./error-report.md
 
 # Run the full factory pipeline: plan → build → test → promote
 snow factory "Build a hardware asset request app with approval workflow" --envs test,prod
+
+# AI pre-promotion review of an update set
+snow updateset explain "Sprint 42"
+snow updateset explain "My Feature" --save ./pre-flight.md
+
+# AI code review of a script record
+snow ai audit sys_script_include <sys_id>
+snow ai audit sys_business_rule <sys_id> --field script --save ./review.md
+
+# Assess blast radius before changing a table or field
+snow ai impact incident
+snow ai impact incident --field category --save ./impact.md
+
+# Generate full documentation for a scoped app
+snow ai document x_myco_myapp
+snow ai document x_myco_myapp --out ./docs/myapp.md
 ```
 
 ---

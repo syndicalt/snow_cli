@@ -545,3 +545,133 @@ snow ai fix "Invalid update: sys_id is read-only" --save ./fix-notes.md
 2. **Common triggers** — what typically causes this in ServiceNow
 3. **Fix** — exact code change, configuration step, or role/permission to grant
 4. **Prevention** — how to avoid it in future
+
+---
+
+## snow ai audit
+
+AI code review of a specific ServiceNow script record. Fetches the record, identifies all script-type fields, and asks the LLM to review for bugs, performance issues, ES5 compliance, security concerns, and best practices.
+
+```bash
+# Review all script fields on a script include
+snow ai audit sys_script_include <sys_id>
+
+# Review a specific field
+snow ai audit sys_business_rule <sys_id> --field script
+
+# Save the review report
+snow ai audit sys_script_client <sys_id> --save ./review.md
+
+# Use a specific provider
+snow ai audit sys_script_include <sys_id> --provider anthropic
+```
+
+| Flag | Description |
+|---|---|
+| `-f, --field <field>` | Specific field to review (default: all script-type fields detected from `sys_dictionary`) |
+| `--provider <name>` | Override the active LLM provider |
+| `--save <file>` | Write the review to a markdown file |
+
+**Review criteria:**
+
+| Category | What is checked |
+|---|---|
+| **Correctness** | Logical errors, missing null checks, missing `.query()`, wrong GlideRecord API usage |
+| **Performance** | Queries inside loops, no row limits, excessive synchronous calls |
+| **Security** | Hardcoded credentials, privilege escalation, injection risks |
+| **ES5 Compliance** | No arrow functions, no `const`/`let` (use `var`), no template literals, no destructuring, `Class.create()` not ES6 `class` |
+| **Best Practices** | Proper error handling, scope awareness, GlideRecord patterns |
+| **Style** | Naming conventions, clarity, comments on complex logic |
+
+**Output format:** Issues are grouped as Critical / High / Medium / Low / Info with location, description, and exact fix for each. Ends with an overall rating: Needs Work / Acceptable / Good / Excellent.
+
+Works with any table that has script-type fields — `sys_script_include`, `sys_business_rule`, `sys_script_client`, `sys_ui_action`, `sys_scheduled_script_type`, `sys_transform_script`, and more.
+
+---
+
+## snow ai impact
+
+Assess the blast radius of modifying a table or field. Gathers all business rules, client scripts, UI policies, UI actions, data policies, transform maps, and other tables that reference the target, then asks the LLM to predict what will break and how to make the change safely.
+
+```bash
+# Assess the full impact of changing a table
+snow ai impact incident
+
+# Focus on a specific field
+snow ai impact incident --field category
+snow ai impact x_myco_myapp_orders --field status
+
+# Save the analysis
+snow ai impact incident --field priority --save ./impact-report.md
+```
+
+| Flag | Description |
+|---|---|
+| `-f, --field <field>` | Focus analysis on a specific field within the table |
+| `--provider <name>` | Override the active LLM provider |
+| `--save <file>` | Write the analysis to a markdown file |
+
+**What is gathered (all run in parallel):**
+
+| Source | What is fetched |
+|---|---|
+| `sys_business_rule` | Active BRs targeting the table |
+| `sys_script_client` | Active client scripts targeting the table |
+| `sys_ui_policy` | Active UI policies targeting the table |
+| `sys_ui_action` | Active UI actions targeting the table |
+| `sys_data_policy2` | Active data policies targeting the table |
+| `sys_transform_map` | Transform maps where this table is source or target |
+| `sys_dictionary` | Other tables that have a reference field pointing to this table |
+| `sys_dictionary` (field) | Type, label, mandatory, read-only, and default for the specific field |
+
+**AI report structure:**
+
+1. **Summary** — how widely used is this table/field?
+2. **Immediate Break Risk** — what fails the moment the change is deployed?
+3. **Functional Impact** — which business processes are affected?
+4. **Data Impact** — migration needs or integrity concerns?
+5. **Testing Checklist** — specific scenarios to verify after the change
+6. **Recommended Approach** — phased rollout, deprecation, migration scripts, etc.
+7. **Risk Rating** — Low / Medium / High / Critical
+
+---
+
+## snow ai document
+
+Generate comprehensive markdown documentation for a scoped application. Fetches all active artifacts in the scope (script includes, business rules, client scripts, UI actions, scheduled jobs), reads their script content, and asks the LLM to produce a structured developer reference document.
+
+```bash
+snow ai document x_myco_myapp
+snow ai document x_myco_myapp --out ./docs/myapp.md
+snow ai document x_myco_myapp --provider anthropic
+```
+
+| Flag | Description |
+|---|---|
+| `--provider <name>` | Override the active LLM provider |
+| `-o, --out <file>` | Output file path (default: `<scope>-docs.md`) |
+
+**What is fetched (all in parallel):**
+
+- `sys_app` — application name, version, description
+- `sys_script_include` — all active script includes in scope
+- `sys_business_rule` — all active business rules in scope
+- `sys_script_client` — all active client scripts in scope
+- `sys_ui_action` — all active UI actions in scope
+- `sys_scheduled_script_type` — all active scheduled jobs in scope
+
+**Generated document sections:**
+
+| Section | Content |
+|---|---|
+| **Overview** | What the app does and who uses it |
+| **Architecture** | How components fit together |
+| **Script Includes** | Purpose, key methods with signatures, usage examples |
+| **Business Rules** | Trigger (table, when, condition), purpose, side effects |
+| **Client Scripts** | Trigger type, table, what it does in the UI |
+| **UI Actions** | Button/context menu description |
+| **Scheduled Jobs** | Frequency and purpose |
+| **Dependencies** | OOTB tables, cross-scope references, external integrations |
+| **Deployment Notes** | Configuration, required roles, first-time setup |
+
+Script content is truncated to 800 characters per artifact to keep the prompt within LLM context limits while preserving enough code for accurate documentation.

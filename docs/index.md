@@ -21,7 +21,7 @@ A portable CLI for ServiceNow. Query tables, inspect schemas, edit and search sc
 | [`snow bulk`](data#snow-bulk) | Bulk-update records matching a query |
 | [`snow user`](users-attachments#snow-user) | Manage group membership and role assignments |
 | [`snow attachment`](users-attachments#snow-attachment) | Download and upload record attachments |
-| [`snow updateset`](updatesets) | List, export, import, and diff update sets |
+| [`snow updateset`](updatesets) | List, export, import, diff, and AI-explain update sets |
 | [`snow run`](admin#snow-run) | Execute a server-side script on the instance |
 | [`snow sys`](admin#snow-sys) | Read and write system properties |
 | [`snow approval`](admin#snow-approval) | List, approve, and reject approval requests |
@@ -43,6 +43,10 @@ A portable CLI for ServiceNow. Query tables, inspect schemas, edit and search sc
 | [`snow ai query`](ai#snow-ai-query) | Translate natural language into an encoded query string |
 | [`snow ai translate`](ai#snow-ai-translate) | Translate an encoded query string into plain English |
 | [`snow ai fix`](ai#snow-ai-fix) | Diagnose a ServiceNow error and get a fix |
+| [`snow updateset explain`](updatesets#explain) | AI pre-promotion review of an update set |
+| [`snow ai audit`](ai#snow-ai-audit) | AI code review of a script record |
+| [`snow ai impact`](ai#snow-ai-impact) | Blast radius analysis for table or field changes |
+| [`snow ai document`](ai#snow-ai-document) | Generate markdown docs for a scoped application |
 
 ---
 

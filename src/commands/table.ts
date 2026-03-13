@@ -9,7 +9,7 @@ import type { QueryOptions } from '../types/index.js';
  * Flatten a ServiceNow field value to a display string.
  * Reference fields may come back as { value, display_value } objects.
  */
-function flattenValue(val: unknown): string {
+export function flattenValue(val: unknown): string {
   if (val === null || val === undefined) return '';
   if (typeof val === 'object' && !Array.isArray(val)) {
     const obj = val as Record<string, unknown>;

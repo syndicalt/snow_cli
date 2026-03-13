@@ -51,7 +51,7 @@ function resolveProvider() {
  * Normalise an LLM artifact response that may use flat fields instead of
  * the expected { type, fields: { ... } } shape.
  */
-function normaliseBuildResponse(parsed: Record<string, unknown>): SNBuildResponse {
+export function normaliseBuildResponse(parsed: Record<string, unknown>): SNBuildResponse {
   const name = String(parsed['name'] ?? '');
   const description = String(parsed['description'] ?? '');
 
@@ -100,19 +100,19 @@ function normaliseBuildResponse(parsed: Record<string, unknown>): SNBuildRespons
   return { name, description, scope, artifacts };
 }
 
-function parseBuildResponse(raw: string): SNBuildResponse {
+export function parseBuildResponse(raw: string): SNBuildResponse {
   const json = extractJSON(raw);
   dbg('extracted JSON', json);
   const parsed = JSON.parse(json) as Record<string, unknown>;
   return normaliseBuildResponse(parsed);
 }
 
-function slugify(str: string): string {
+export function slugify(str: string): string {
   return str.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
 }
 
 /** Compute the artifact diff between two builds for display. */
-function diffBuilds(
+export function diffBuilds(
   previous: SNBuildResponse | null,
   next: SNBuildResponse
 ): { added: SNArtifact[]; updated: SNArtifact[]; removed: SNArtifact[] } {
